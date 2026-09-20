@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Planner connection test</title>
+
+<!--
+  Strict Content-Security-Policy: this page will not run any script except
+  the one file we wrote ourselves (spike.js), and will not load anything
+  from the network except a fetch() to Google's script domains. That means
+  no inline <script> tags and no onclick="..." attributes anywhere below —
+  every bit of behaviour lives in spike.js instead.
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src https://script.google.com https://script.googleusercontent.com; base-uri 'none'; form-action 'none'">
+
+<style>
+  /* Hand-written CSS, no framework. Colours are defined once as variables
+     so light/dark mode is just two small blocks below. */
+  :root {
+    --bg: #f5f5f7;
+    --panel: #ffffff;
+    --text: #1a1a1a;
+    --muted: #6b6b70;
+    --border: #d8d8dc;
+    --accent: #2f6fed;
+    --accent-text: #ffffff;
+    --ok: #1a7f37;
+    --error: #b3261e;
+    --error-bg: #fbeceb;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181a;
+      --panel: #232427;
+      --text: #f0f0f2;
+      --muted: #a3a3a8;
+      --border: #3a3b3f;
+      --accent: #6d9bff;
+      --accent-text: #10131a;
+      --ok: #5fd07a;
+      --error: #ff8a80;
+      --error-bg: #3a1f1d;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 16px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.4;
+  }
+
+  main {
+    max-width: 480px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  h1 {
+    font-size: 1.25rem;
+    margin: 8px 0 0;
+  }
+
+  p.subtitle {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+
+  section {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  label {
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+
+  input[type="password"] {
+    width: 100%;
+    min-height: 44px;
+    padding: 10px 12px;
+    font-size: 1rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--text);
+  }
+
+  button {
+    min-height: 44px;
+    min-width: 44px;
+    padding: 10px 16px;
+    font-size: 0.95rem;
+    font-weight: 600;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    cursor: pointer;
+  }
+
+  button.primary {
+    background: var(--accent);
+    color: var(--accent-text);
+    border-color: var(--accent);
+  }
+
+  button:active {
+    opacity: 0.8;
+  }
+
+  .row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .row button {
+    flex: 1;
+  }
+
+  .saved-key {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .saved-key .status {
+    color: var(--ok);
+    font-weight: 600;
+  }
+
+  #hidden-when-saved.is-hidden,
+  #shown-when-saved.is-hidden {
+    display: none;
+  }
+
+  pre#result {
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    font-size: 0.85rem;
+    margin: 0;
+    min-height: 44px;
+  }
+
+  .error-text {
+    color: var(--error);
+    background: var(--error-bg);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 0.9rem;
+  }
+
+  footer {
+    color: var(--muted);
+    font-size: 0.75rem;
+    text-align: center;
+    padding-bottom: 24px;
+  }
+</style>
+</head>
+<body>
+<main>
+  <div>
+    <h1>Planner connection test</h1>
+    <p class="subtitle">Phase 0 spike — checks that the browser can reach the Apps Script backend with a device key.</p>
+  </div>
+
+  <section id="config-warning" class="is-hidden">
+    <p class="error-text" id="config-warning-text"></p>
+  </section>
+
+  <section aria-label="Device key">
+    <div id="hidden-when-saved">
+      <label for="device-key-input">Device key</label>
+      <input id="device-key-input" type="password" autocomplete="off" placeholder="Paste your device key">
+      <div class="row" style="margin-top: 8px;">
+        <button id="save-key-btn" class="primary" type="button">Save on this device</button>
+      </div>
+    </div>
+    <div id="shown-when-saved" class="saved-key is-hidden">
+      <span class="status">Key saved &#10003;</span>
+      <button id="forget-key-btn" type="button">Forget key</button>
+    </div>
+  </section>
+
+  <section aria-label="Actions">
+    <div class="row">
+      <button id="ping-btn" class="primary" type="button">Ping</button>
+      <button id="list-btn" class="primary" type="button">List tasks</button>
+    </div>
+    <pre id="result">Nothing tried yet.</pre>
+  </section>
+
+  <footer id="api-target"></footer>
+</main>
+
+<script src="config.js"></script>
+<script src="spike.js"></script>
+</body>
+</html>
