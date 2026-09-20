@@ -2,173 +2,409 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Weekly Focus & Backlog Planner</title>
-  <script src="https://cdn.tailwindcss.com"></script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Master Planner & Backlog</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .task-card { transition: transform 0.15s ease, box-shadow 0.15s ease; }
+    .task-card:hover { transform: translateY(-2px); }
+    .task-card.dragging { opacity: 0.4; transform: scale(0.98); }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+  </style>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col font-sans">
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col font-sans select-none">
 
-  <!-- Top Bar -->
-  <header class="border-b border-slate-800 px-6 py-4 flex items-center justify-between bg-slate-900/50 backdrop-blur">
-    <div>
-      <h1 class="text-xl font-bold tracking-tight text-white">Central Task Planner</h1>
-      <p class="text-xs text-slate-400">Single Source of Truth: Google Sheets</p>
+  <!-- ==================== CONFIGURATION ==================== -->
+  <script>
+    // Paste your Google Apps Script Web App Deployment URL here:
+    const API_URL = "https://script.google.com/macros/s/AKfycbw8fHeY0u5Yg-CUAj3DW6Hx-G2_e_XmiyUQyViKsgdasmCKjy1u2dxIXVVgd17mSU_Zsg/exec";
+  </script>
+
+  <!-- ==================== TOP NAVIGATION ==================== -->
+  <header class="border-b border-slate-800 px-6 py-3.5 flex items-center justify-between bg-slate-900/60 backdrop-blur sticky top-0 z-20">
+    <div class="flex items-center gap-4">
+      <div>
+        <h1 class="text-lg font-bold tracking-tight text-white flex items-center gap-2">
+          Central Task Planner
+          <span id="syncStatus" class="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 font-medium">Ready</span>
+        </h1>
+        <p class="text-xs text-slate-400">Google Sheets Single Source of Truth</p>
+      </div>
     </div>
-    <div class="flex gap-2">
-      <input id="quickTaskInput" type="text" placeholder="+ Add task to backlog..." 
-        class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:border-indigo-500 w-64" />
-      <button onclick="addNewBacklogItem()" class="bg-indigo-600 hover:bg-indigo-500 px-3 py-1.5 rounded-lg text-sm font-medium transition">Add</button>
+
+    <div class="flex items-center gap-3">
+      <input id="searchInput" type="text" oninput="filterTasks()" placeholder="Search tasks or categories..." 
+        class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:border-indigo-500 w-56 text-slate-200 placeholder-slate-500">
+      
+      <button onclick="openEditModal()" class="bg-indigo-600 hover:bg-indigo-500 px-3.5 py-1.5 rounded-lg text-xs font-semibold tracking-wide transition flex items-center gap-1.5 shadow-lg shadow-indigo-600/20">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
+        New Task
+      </button>
+
+      <button onclick="fetchTasksFromSheet()" title="Refresh from Sheet" class="p-1.5 text-slate-400 hover:text-white bg-slate-800 rounded-lg transition border border-slate-700">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+      </button>
     </div>
   </header>
 
-  <!-- Main View Grid -->
-  <div class="flex-1 flex overflow-hidden p-6 gap-6">
+  <!-- ==================== MAIN BOARD ==================== -->
+  <div class="flex-1 flex overflow-hidden p-4 gap-4">
     
-    <!-- Left: Unscheduled Backlog -->
-    <aside class="w-80 flex-shrink-0 bg-slate-900 border border-slate-800 rounded-xl flex flex-col overflow-hidden">
-      <div class="p-4 border-b border-slate-800 flex justify-between items-center bg-slate-900/80">
-        <h2 class="font-semibold text-sm text-slate-200">Backlog (Unscheduled)</h2>
-        <span id="backlogCount" class="text-xs bg-slate-800 px-2 py-0.5 rounded-full text-slate-400">0</span>
+    <!-- Left Drawer: Backlog Column -->
+    <aside class="w-84 flex-shrink-0 bg-slate-900/70 border border-slate-800 rounded-xl flex flex-col overflow-hidden shadow-xl">
+      <div class="p-3.5 border-b border-slate-800 flex justify-between items-center bg-slate-900/90">
+        <div class="flex items-center gap-2">
+          <h2 class="font-semibold text-xs tracking-wider uppercase text-slate-300">Backlog (Unscheduled)</h2>
+          <span id="backlogCount" class="text-xs bg-slate-800 px-2 py-0.5 rounded-full text-slate-400 font-mono">0</span>
+        </div>
       </div>
-      <div id="backlogContainer" class="flex-1 overflow-y-auto p-3 space-y-2" ondragover="allowDrop(event)" ondrop="drop(event, 'Backlog')">
-        <!-- Backlog Cards Loaded Dynamically -->
+      <div id="col-Backlog" class="flex-1 overflow-y-auto p-2.5 space-y-2.5" ondragover="allowDrop(event)" ondrop="handleDrop(event, 'Backlog')">
+        <!-- Backlog Cards Injected Here -->
       </div>
     </aside>
 
-    <!-- Right: Week Columns (Sunday -> Saturday) -->
-    <main class="flex-1 grid grid-cols-7 gap-3 overflow-x-auto pb-2">
-      <!-- Days rendered via JavaScript -->
+    <!-- Right Grid: 7-Day Columns -->
+    <main id="weekGrid" class="flex-1 grid grid-cols-7 gap-3 overflow-x-auto pb-1">
+      <!-- Days Sunday -> Saturday Injected Here -->
     </main>
   </div>
 
+  <!-- ==================== TASK EDIT/CREATE MODAL ==================== -->
+  <div id="taskModal" class="hidden fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-xl max-w-md w-full p-5 shadow-2xl space-y-4">
+      <div class="flex justify-between items-center pb-2 border-b border-slate-800">
+        <h3 id="modalHeading" class="font-semibold text-sm text-white">Edit Task</h3>
+        <button onclick="closeEditModal()" class="text-slate-400 hover:text-white">&times;</button>
+      </div>
+
+      <input type="hidden" id="modalTaskId">
+
+      <div>
+        <label class="block text-[11px] font-semibold tracking-wider uppercase text-slate-400 mb-1">Task Title</label>
+        <input id="modalTaskTitle" type="text" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500">
+      </div>
+
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-[11px] font-semibold tracking-wider uppercase text-slate-400 mb-1">Category</label>
+          <select id="modalTaskCategory" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-xs text-white focus:outline-none">
+            <option value="Career & Learning">Career & Learning</option>
+            <option value="Finances & Subscriptions">Finances & Subscriptions</option>
+            <option value="Health & Personal Care">Health & Personal Care</option>
+            <option value="Household & Chores">Household & Chores</option>
+            <option value="Shopping & Groceries">Shopping & Groceries</option>
+            <option value="Holidays & Travel">Holidays & Travel</option>
+            <option value="Leisure & Pending Experiences">Leisure & Pending Experiences</option>
+            <option value="Admin & Organization">Admin & Organization</option>
+            <option value="Relationship & Family">Relationship & Family</option>
+            <option value="Inbox">Inbox</option>
+          </select>
+        </div>
+
+        <div>
+          <label class="block text-[11px] font-semibold tracking-wider uppercase text-slate-400 mb-1">Subcategory</label>
+          <input id="modalTaskSubcategory" type="text" placeholder="e.g. Grooming, Refunds" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none">
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-[11px] font-semibold tracking-wider uppercase text-slate-400 mb-1">Scheduled Day</label>
+          <select id="modalTaskDay" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-xs text-white focus:outline-none">
+            <option value="Backlog">Backlog</option>
+            <option value="Sunday">Sunday</option>
+            <option value="Monday">Monday</option>
+            <option value="Tuesday">Tuesday</option>
+            <option value="Wednesday">Wednesday</option>
+            <option value="Thursday">Thursday</option>
+            <option value="Friday">Friday</option>
+            <option value="Saturday">Saturday</option>
+          </select>
+        </div>
+
+        <div>
+          <label class="block text-[11px] font-semibold tracking-wider uppercase text-slate-400 mb-1">Estimated Minutes</label>
+          <input id="modalTaskMinutes" type="number" step="5" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none">
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between pt-3 border-t border-slate-800">
+        <button id="modalDeleteBtn" onclick="deleteTaskFromModal()" class="text-rose-400 hover:text-rose-300 text-xs font-semibold">Delete Task</button>
+        <div class="flex gap-2">
+          <button onclick="closeEditModal()" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg">Cancel</button>
+          <button onclick="saveTaskModal()" class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg shadow">Save Changes</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== APPLICATION LOGIC ==================== -->
   <script>
-    // Config: Point this to your deployed Apps Script URL
-    const API_URL = "https://script.google.com/macros/s/AKfycbw8fHeY0u5Yg-CUAj3DW6Hx-G2_e_XmiyUQyViKsgdasmCKjy1u2dxIXVVgd17mSU_Zsg/exec";
-
-    // Initial mock data mapped from your consolidated backlog
-    let tasks = [
-      { id: "t1", task: "Barbour jacket waxing", category: "Household & Chores", scheduled_day: "Sunday", status: "Scheduled" },
-      { id: "t2", task: "Meal prep", category: "Household & Chores", scheduled_day: "Sunday", status: "Scheduled" },
-      { id: "t3", task: "Finances with Katherine", category: "Finances & Subscriptions", scheduled_day: "Monday", status: "Scheduled" },
-      { id: "t4", task: "Dentist appointment", category: "Health & Personal Care", scheduled_day: "Backlog", status: "Backlog" },
-      { id: "t5", task: "Order coffee beans", category: "Shopping & Groceries", scheduled_day: "Backlog", status: "Backlog" },
-      { id: "t6", task: "CV refresh", category: "Career & Learning", scheduled_day: "Backlog", status: "Backlog" }
-    ];
-
     const daysOfWeek = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    let tasks = [];
+    let draggedTaskId = null;
+
+    // Distinct Theme Palette mapped to each Category
+    const categoryThemes = {
+      "Career & Learning": { badge: "bg-violet-500/15 text-violet-300 border-violet-500/30", border: "border-l-violet-500" },
+      "Finances & Subscriptions": { badge: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30", border: "border-l-emerald-500" },
+      "Health & Personal Care": { badge: "bg-rose-500/15 text-rose-300 border-rose-500/30", border: "border-l-rose-500" },
+      "Household & Chores": { badge: "bg-amber-500/15 text-amber-300 border-amber-500/30", border: "border-l-amber-500" },
+      "Shopping & Groceries": { badge: "bg-sky-500/15 text-sky-300 border-sky-500/30", border: "border-l-sky-500" },
+      "Holidays & Travel": { badge: "bg-teal-500/15 text-teal-300 border-teal-500/30", border: "border-l-teal-500" },
+      "Leisure & Pending Experiences": { badge: "bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/30", border: "border-l-fuchsia-500" },
+      "Admin & Organization": { badge: "bg-slate-400/15 text-slate-300 border-slate-400/30", border: "border-l-slate-400" },
+      "Relationship & Family": { badge: "bg-pink-500/15 text-pink-300 border-pink-500/30", border: "border-l-pink-500" },
+      "Inbox": { badge: "bg-indigo-500/15 text-indigo-300 border-indigo-500/30", border: "border-l-indigo-500" }
+    };
 
     function initBoard() {
-      const mainGrid = document.querySelector('main');
-      mainGrid.innerHTML = '';
-
-      daysOfWeek.forEach(day => {
-        const isToday = day === "Sunday"; // Sunday demo
-        const col = document.createElement('div');
-        col.className = `flex flex-col bg-slate-900 border ${isToday ? 'border-indigo-500/50 ring-1 ring-indigo-500/20' : 'border-slate-800'} rounded-xl overflow-hidden min-w-[170px]`;
-        col.innerHTML = `
-          <div class="p-3 border-b border-slate-800 flex justify-between items-center ${isToday ? 'bg-indigo-950/30' : 'bg-slate-900/60'}">
-            <span class="text-xs font-semibold uppercase tracking-wider ${isToday ? 'text-indigo-400' : 'text-slate-400'}">${day}</span>
-            ${isToday ? '<span class="text-[10px] bg-indigo-500/20 text-indigo-300 px-1.5 py-0.5 rounded font-bold">TODAY</span>' : ''}
-          </div>
-          <div id="col-${day}" class="flex-1 p-2 space-y-2 overflow-y-auto min-h-[250px]" 
-               ondragover="allowDrop(event)" ondrop="drop(event, '${day}')"></div>
-        `;
-        mainGrid.appendChild(col);
-      });
-
-      renderTasks();
+      buildGridColumns();
+      fetchTasksFromSheet();
     }
 
-    function renderTasks() {
-      const backlogBox = document.getElementById('backlogContainer');
-      backlogBox.innerHTML = '';
+    function buildGridColumns() {
+      const grid = document.getElementById('weekGrid');
+      grid.innerHTML = '';
+
+      const todayIndex = new Date().getDay(); // 0 is Sunday
+
+      daysOfWeek.forEach((day, index) => {
+        const isToday = index === todayIndex;
+        const col = document.createElement('div');
+        col.className = `flex flex-col bg-slate-900/60 border ${isToday ? 'border-indigo-500/40 ring-1 ring-indigo-500/20' : 'border-slate-800'} rounded-xl overflow-hidden min-w-[160px]`;
+        col.innerHTML = `
+          <div class="p-3 border-b border-slate-800 flex justify-between items-center ${isToday ? 'bg-indigo-950/40' : 'bg-slate-900/80'}">
+            <span class="text-xs font-bold uppercase tracking-wider ${isToday ? 'text-indigo-400' : 'text-slate-400'}">${day}</span>
+            ${isToday ? '<span class="text-[9px] bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 px-1.5 py-0.2 rounded font-bold tracking-wider">TODAY</span>' : ''}
+          </div>
+          <div id="col-${day}" class="flex-1 p-2 space-y-2 overflow-y-auto min-h-[300px]" 
+               ondragover="allowDrop(event)" ondrop="handleDrop(event, '${day}')"></div>
+        `;
+        grid.appendChild(col);
+      });
+    }
+
+    function renderBoard(filteredList = null) {
+      const renderPool = filteredList || tasks;
+      document.getElementById('col-Backlog').innerHTML = '';
       daysOfWeek.forEach(d => document.getElementById(`col-${d}`).innerHTML = '');
 
-      let backlogTotal = 0;
+      let backlogCount = 0;
 
-      tasks.forEach(t => {
+      renderPool.forEach(task => {
+        const theme = categoryThemes[task.category] || categoryThemes["Inbox"];
+        const isDone = task.status === 'Done';
+
         const card = document.createElement('div');
-        card.id = t.id;
+        card.id = task.id;
         card.draggable = true;
-        card.ondragstart = drag;
-        card.className = "bg-slate-800/80 hover:bg-slate-800 p-3 rounded-lg border border-slate-700/60 shadow-sm cursor-grab active:cursor-grabbing text-sm flex flex-col gap-1.5 transition";
+        card.ondragstart = (e) => handleDragStart(e, task.id);
+        card.ondragend = handleDragEnd;
+        card.onclick = (e) => {
+          if (e.target.type !== 'checkbox') openEditModal(task.id);
+        };
+
+        card.className = `task-card cursor-pointer bg-slate-800/80 hover:bg-slate-800 p-3 rounded-lg border border-slate-700/60 border-l-4 ${theme.border} shadow-sm text-xs flex flex-col gap-2`;
         card.innerHTML = `
           <div class="flex items-start justify-between gap-2">
-            <span class="${t.status === 'Done' ? 'line-through text-slate-500' : 'text-slate-200'} font-medium leading-tight">${t.task}</span>
-            <input type="checkbox" ${t.status === 'Done' ? 'checked' : ''} onchange="toggleDone('${t.id}')" class="rounded border-slate-700 mt-0.5 bg-slate-900 text-indigo-600 focus:ring-0">
+            <span class="${isDone ? 'line-through text-slate-500' : 'text-slate-200 font-medium'} leading-snug break-words flex-1">${task.task}</span>
+            <input type="checkbox" ${isDone ? 'checked' : ''} onchange="toggleDone('${task.id}', event)" class="rounded border-slate-700 bg-slate-900 text-indigo-600 focus:ring-0 cursor-pointer">
           </div>
-          <span class="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">${t.category || 'General'}</span>
+          <div class="flex items-center justify-between pt-1">
+            <span class="text-[10px] px-2 py-0.5 rounded border font-medium ${theme.badge}">${task.category}</span>
+            ${task.estimated_min ? `<span class="text-[10px] text-slate-500 font-mono">${task.estimated_min}m</span>` : ''}
+          </div>
         `;
 
-        if (t.scheduled_day === "Backlog" || !t.scheduled_day) {
-          backlogBox.appendChild(card);
-          backlogTotal++;
+        if (!task.scheduled_day || task.scheduled_day === "Backlog") {
+          document.getElementById('col-Backlog').appendChild(card);
+          backlogCount++;
         } else {
-          const dayCol = document.getElementById(`col-${t.scheduled_day}`);
-          if (dayCol) dayCol.appendChild(card);
+          const dayContainer = document.getElementById(`col-${task.scheduled_day}`);
+          if (dayContainer) dayContainer.appendChild(card);
         }
       });
 
-      document.getElementById('backlogCount').innerText = backlogTotal;
+      document.getElementById('backlogCount').innerText = backlogCount;
     }
 
-    function drag(ev) {
-      ev.dataTransfer.setData("text", ev.target.id);
+    // ==================== DRAG & DROP ====================
+    function handleDragStart(e, id) {
+      draggedTaskId = id;
+      e.dataTransfer.setData('text/plain', id);
+      setTimeout(() => e.target.classList.add('dragging'), 0);
     }
 
-    function allowDrop(ev) {
-      ev.preventDefault();
+    function handleDragEnd(e) {
+      e.target.classList.remove('dragging');
+      draggedTaskId = null;
     }
 
-    function drop(ev, targetDay) {
-      ev.preventDefault();
-      const taskId = ev.dataTransfer.getData("text");
-      const task = tasks.find(t => t.id === taskId);
+    function allowDrop(e) { e.preventDefault(); }
+
+    function handleDrop(e, targetDay) {
+      e.preventDefault();
+      const task = tasks.find(t => t.id === draggedTaskId);
+      if (!task) return;
+
+      task.scheduled_day = targetDay;
+      task.status = targetDay === 'Backlog' ? 'Backlog' : (task.status === 'Done' ? 'Done' : 'Scheduled');
+      renderBoard();
+      syncTaskToBackend(task);
+    }
+
+    function toggleDone(id, event) {
+      event.stopPropagation();
+      const task = tasks.find(t => t.id === id);
+      if (!task) return;
+
+      task.status = event.target.checked ? 'Done' : (task.scheduled_day === 'Backlog' ? 'Backlog' : 'Scheduled');
+      renderBoard();
+      syncTaskToBackend(task);
+    }
+
+    // ==================== MODAL & CRUD ====================
+    function openEditModal(taskId = null) {
+      const modal = document.getElementById('taskModal');
+      modal.classList.remove('hidden');
+
+      if (taskId) {
+        const task = tasks.find(t => t.id === taskId);
+        document.getElementById('modalHeading').innerText = "Edit Task";
+        document.getElementById('modalTaskId').value = task.id;
+        document.getElementById('modalTaskTitle').value = task.task;
+        document.getElementById('modalTaskCategory').value = task.category || "Inbox";
+        document.getElementById('modalTaskSubcategory').value = task.subcategory || "";
+        document.getElementById('modalTaskDay').value = task.scheduled_day || "Backlog";
+        document.getElementById('modalTaskMinutes').value = task.estimated_min || 15;
+        document.getElementById('modalDeleteBtn').classList.remove('hidden');
+      } else {
+        document.getElementById('modalHeading').innerText = "Create Task";
+        document.getElementById('modalTaskId').value = "";
+        document.getElementById('modalTaskTitle').value = "";
+        document.getElementById('modalTaskCategory').value = "Career & Learning";
+        document.getElementById('modalTaskSubcategory').value = "";
+        document.getElementById('modalTaskDay').value = "Backlog";
+        document.getElementById('modalTaskMinutes').value = 15;
+        document.getElementById('modalDeleteBtn').classList.add('hidden');
+      }
+    }
+
+    function closeEditModal() {
+      document.getElementById('taskModal').classList.add('hidden');
+    }
+
+    function saveTaskModal() {
+      const id = document.getElementById('modalTaskId').value;
+      const title = document.getElementById('modalTaskTitle').value.trim();
+      if (!title) return alert("Task title cannot be empty");
+
+      const category = document.getElementById('modalTaskCategory').value;
+      const subcategory = document.getElementById('modalTaskSubcategory').value.trim();
+      const day = document.getElementById('modalTaskDay').value;
+      const minutes = parseInt(document.getElementById('modalTaskMinutes').value) || 0;
+
+      if (id) {
+        // Update existing task
+        const task = tasks.find(t => t.id === id);
+        task.task = title;
+        task.category = category;
+        task.subcategory = subcategory;
+        task.scheduled_day = day;
+        task.estimated_min = minutes;
+        if (day === 'Backlog' && task.status !== 'Done') task.status = 'Backlog';
+        syncTaskToBackend(task);
+      } else {
+        // Create new task
+        const newTask = {
+          id: "TSK-" + Date.now().toString().slice(-4),
+          task: title,
+          category: category,
+          subcategory: subcategory,
+          scheduled_day: day,
+          estimated_min: minutes,
+          status: day === 'Backlog' ? 'Backlog' : 'Scheduled'
+        };
+        tasks.push(newTask);
+        syncTaskToBackend(newTask);
+      }
+
+      closeEditModal();
+      renderBoard();
+    }
+
+    function deleteTaskFromModal() {
+      const id = document.getElementById('modalTaskId').value;
+      if (!id || !confirm("Are you sure you want to delete this task?")) return;
+
+      tasks = tasks.filter(t => t.id !== id);
+      closeEditModal();
+      renderBoard();
+
+      // Post delete to backend
+      syncTaskToBackend({ id: id, _action: 'DELETE' });
+    }
+
+    function filterTasks() {
+      const q = document.getElementById('searchInput').value.toLowerCase();
+      if (!q) return renderBoard();
+
+      const filtered = tasks.filter(t => 
+        t.task.toLowerCase().includes(q) || 
+        t.category.toLowerCase().includes(q) || 
+        (t.subcategory && t.subcategory.toLowerCase().includes(q))
+      );
+      renderBoard(filtered);
+    }
+
+    // ==================== GOOGLE SHEETS API ====================
+    async function fetchTasksFromSheet() {
+      setSyncState("Syncing...", "bg-amber-500/20 text-amber-400");
       
-      if (task) {
-        task.scheduled_day = targetDay;
-        task.status = targetDay === "Backlog" ? "Backlog" : (task.status === "Done" ? "Done" : "Scheduled");
-        renderTasks();
-        syncWithBackend(task);
+      if (!API_URL || API_URL === "YOUR_APPS_SCRIPT_WEB_APP_URL") {
+        setSyncState("Mock Data", "bg-slate-500/20 text-slate-400");
+        return;
+      }
+
+      try {
+        const res = await fetch(API_URL);
+        const data = await res.json();
+        if (Array.isArray(data) && data.length > 0) {
+          tasks = data;
+          renderBoard();
+          setSyncState("Synced", "bg-emerald-500/20 text-emerald-400");
+        }
+      } catch (err) {
+        console.error("Fetch failed", err);
+        setSyncState("Sync Offline", "bg-rose-500/20 text-rose-400");
       }
     }
 
-    function toggleDone(taskId) {
-      const task = tasks.find(t => t.id === taskId);
-      if (task) {
-        task.status = task.status === "Done" ? "Scheduled" : "Done";
-        renderTasks();
-        syncWithBackend(task);
-      }
-    }
+    async function syncTaskToBackend(payload) {
+      setSyncState("Saving...", "bg-amber-500/20 text-amber-400");
+      if (!API_URL || API_URL === "YOUR_APPS_SCRIPT_WEB_APP_URL") return;
 
-    function addNewBacklogItem() {
-      const input = document.getElementById('quickTaskInput');
-      if (!input.value.trim()) return;
-      const newTask = {
-        id: "task_" + Date.now(),
-        task: input.value.trim(),
-        category: "Inbox",
-        scheduled_day: "Backlog",
-        status: "Backlog"
-      };
-      tasks.push(newTask);
-      input.value = "";
-      renderTasks();
-      syncWithBackend(newTask);
-    }
-
-    async function syncWithBackend(task) {
       try {
         await fetch(API_URL, {
           method: "POST",
-          mode: "no-cors",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(task)
+          mode: "no-cors", // Required for Google Apps Script Web App redirects
+          headers: { "Content-Type": "text/plain" },
+          body: JSON.stringify(payload)
         });
+        setTimeout(() => setSyncState("Synced", "bg-emerald-500/20 text-emerald-400"), 800);
       } catch (err) {
-        console.error("Backend sync failed:", err);
+        console.error("Backend write error", err);
+        setSyncState("Save Failed", "bg-rose-500/20 text-rose-400");
       }
+    }
+
+    function setSyncState(label, classes) {
+      const badge = document.getElementById('syncStatus');
+      badge.innerText = label;
+      badge.className = `text-[10px] px-2 py-0.5 rounded-full font-medium ${classes}`;
     }
 
     window.onload = initBoard;
