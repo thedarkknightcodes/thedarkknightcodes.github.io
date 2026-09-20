@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Weekly Focus & Backlog Planner</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col font-sans">
+
+  <!-- Top Bar -->
+  <header class="border-b border-slate-800 px-6 py-4 flex items-center justify-between bg-slate-900/50 backdrop-blur">
+    <div>
+      <h1 class="text-xl font-bold tracking-tight text-white">Central Task Planner</h1>
+      <p class="text-xs text-slate-400">Single Source of Truth: Google Sheets</p>
+    </div>
+    <div class="flex gap-2">
+      <input id="quickTaskInput" type="text" placeholder="+ Add task to backlog..." 
+        class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:border-indigo-500 w-64" />
+      <button onclick="addNewBacklogItem()" class="bg-indigo-600 hover:bg-indigo-500 px-3 py-1.5 rounded-lg text-sm font-medium transition">Add</button>
+    </div>
+  </header>
+
+  <!-- Main View Grid -->
+  <div class="flex-1 flex overflow-hidden p-6 gap-6">
+    
+    <!-- Left: Unscheduled Backlog -->
+    <aside class="w-80 flex-shrink-0 bg-slate-900 border border-slate-800 rounded-xl flex flex-col overflow-hidden">
+      <div class="p-4 border-b border-slate-800 flex justify-between items-center bg-slate-900/80">
+        <h2 class="font-semibold text-sm text-slate-200">Backlog (Unscheduled)</h2>
+        <span id="backlogCount" class="text-xs bg-slate-800 px-2 py-0.5 rounded-full text-slate-400">0</span>
+      </div>
+      <div id="backlogContainer" class="flex-1 overflow-y-auto p-3 space-y-2" ondragover="allowDrop(event)" ondrop="drop(event, 'Backlog')">
+        <!-- Backlog Cards Loaded Dynamically -->
+      </div>
+    </aside>
+
+    <!-- Right: Week Columns (Sunday -> Saturday) -->
+    <main class="flex-1 grid grid-cols-7 gap-3 overflow-x-auto pb-2">
+      <!-- Days rendered via JavaScript -->
+    </main>
+  </div>
+
+  <script>
+    // Config: Point this to your deployed Apps Script URL
+    const API_URL = "https://script.google.com/macros/s/AKfycbw8fHeY0u5Yg-CUAj3DW6Hx-G2_e_XmiyUQyViKsgdasmCKjy1u2dxIXVVgd17mSU_Zsg/exec";
+
+    // Initial mock data mapped from your consolidated backlog
+    let tasks = [
+      { id: "t1", task: "Barbour jacket waxing", category: "Household & Chores", scheduled_day: "Sunday", status: "Scheduled" },
+      { id: "t2", task: "Meal prep", category: "Household & Chores", scheduled_day: "Sunday", status: "Scheduled" },
+      { id: "t3", task: "Finances with Katherine", category: "Finances & Subscriptions", scheduled_day: "Monday", status: "Scheduled" },
+      { id: "t4", task: "Dentist appointment", category: "Health & Personal Care", scheduled_day: "Backlog", status: "Backlog" },
+      { id: "t5", task: "Order coffee beans", category: "Shopping & Groceries", scheduled_day: "Backlog", status: "Backlog" },
+      { id: "t6", task: "CV refresh", category: "Career & Learning", scheduled_day: "Backlog", status: "Backlog" }
+    ];
+
+    const daysOfWeek = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+    function initBoard() {
+      const mainGrid = document.querySelector('main');
+      mainGrid.innerHTML = '';
+
+      daysOfWeek.forEach(day => {
+        const isToday = day === "Sunday"; // Sunday demo
+        const col = document.createElement('div');
+        col.className = `flex flex-col bg-slate-900 border ${isToday ? 'border-indigo-500/50 ring-1 ring-indigo-500/20' : 'border-slate-800'} rounded-xl overflow-hidden min-w-[170px]`;
+        col.innerHTML = `
+          <div class="p-3 border-b border-slate-800 flex justify-between items-center ${isToday ? 'bg-indigo-950/30' : 'bg-slate-900/60'}">
+            <span class="text-xs font-semibold uppercase tracking-wider ${isToday ? 'text-indigo-400' : 'text-slate-400'}">${day}</span>
+            ${isToday ? '<span class="text-[10px] bg-indigo-500/20 text-indigo-300 px-1.5 py-0.5 rounded font-bold">TODAY</span>' : ''}
+          </div>
+          <div id="col-${day}" class="flex-1 p-2 space-y-2 overflow-y-auto min-h-[250px]" 
+               ondragover="allowDrop(event)" ondrop="drop(event, '${day}')"></div>
+        `;
+        mainGrid.appendChild(col);
+      });
+
+      renderTasks();
+    }
+
+    function renderTasks() {
+      const backlogBox = document.getElementById('backlogContainer');
+      backlogBox.innerHTML = '';
+      daysOfWeek.forEach(d => document.getElementById(`col-${d}`).innerHTML = '');
+
+      let backlogTotal = 0;
+
+      tasks.forEach(t => {
+        const card = document.createElement('div');
+        card.id = t.id;
+        card.draggable = true;
+        card.ondragstart = drag;
+        card.className = "bg-slate-800/80 hover:bg-slate-800 p-3 rounded-lg border border-slate-700/60 shadow-sm cursor-grab active:cursor-grabbing text-sm flex flex-col gap-1.5 transition";
+        card.innerHTML = `
+          <div class="flex items-start justify-between gap-2">
+            <span class="${t.status === 'Done' ? 'line-through text-slate-500' : 'text-slate-200'} font-medium leading-tight">${t.task}</span>
+            <input type="checkbox" ${t.status === 'Done' ? 'checked' : ''} onchange="toggleDone('${t.id}')" class="rounded border-slate-700 mt-0.5 bg-slate-900 text-indigo-600 focus:ring-0">
+          </div>
+          <span class="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">${t.category || 'General'}</span>
+        `;
+
+        if (t.scheduled_day === "Backlog" || !t.scheduled_day) {
+          backlogBox.appendChild(card);
+          backlogTotal++;
+        } else {
+          const dayCol = document.getElementById(`col-${t.scheduled_day}`);
+          if (dayCol) dayCol.appendChild(card);
+        }
+      });
+
+      document.getElementById('backlogCount').innerText = backlogTotal;
+    }
+
+    function drag(ev) {
+      ev.dataTransfer.setData("text", ev.target.id);
+    }
+
+    function allowDrop(ev) {
+      ev.preventDefault();
+    }
+
+    function drop(ev, targetDay) {
+      ev.preventDefault();
+      const taskId = ev.dataTransfer.getData("text");
+      const task = tasks.find(t => t.id === taskId);
+      
+      if (task) {
+        task.scheduled_day = targetDay;
+        task.status = targetDay === "Backlog" ? "Backlog" : (task.status === "Done" ? "Done" : "Scheduled");
+        renderTasks();
+        syncWithBackend(task);
+      }
+    }
+
+    function toggleDone(taskId) {
+      const task = tasks.find(t => t.id === taskId);
+      if (task) {
+        task.status = task.status === "Done" ? "Scheduled" : "Done";
+        renderTasks();
+        syncWithBackend(task);
+      }
+    }
+
+    function addNewBacklogItem() {
+      const input = document.getElementById('quickTaskInput');
+      if (!input.value.trim()) return;
+      const newTask = {
+        id: "task_" + Date.now(),
+        task: input.value.trim(),
+        category: "Inbox",
+        scheduled_day: "Backlog",
+        status: "Backlog"
+      };
+      tasks.push(newTask);
+      input.value = "";
+      renderTasks();
+      syncWithBackend(newTask);
+    }
+
+    async function syncWithBackend(task) {
+      try {
+        await fetch(API_URL, {
+          method: "POST",
+          mode: "no-cors",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(task)
+        });
+      } catch (err) {
+        console.error("Backend sync failed:", err);
+      }
+    }
+
+    window.onload = initBoard;
+  </script>
+</body>
+</html>
