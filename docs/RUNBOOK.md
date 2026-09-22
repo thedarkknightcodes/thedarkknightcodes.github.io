@@ -389,3 +389,21 @@ turns the whole nightly job off if you ever want to pause it.
 Properties the code manages for you automatically (same idea as
 `DEVICE_KEY` — Project Settings → Script Properties, if you're curious).
 You shouldn't normally need to touch them by hand.
+
+### If you see "The script does not have permission … calendar"
+
+Google only asks for permissions the first time you run something. If the
+script was authorised before the calendar code existed, it keeps the OLD
+set of permissions and every calendar call fails with this message. Fix:
+
+1. In the editor, open `appsscript.json` and check it contains the
+   `oauthScopes` list from the repo (with a `calendar` line). If not, paste
+   the repo's version in and save.
+2. Go to https://myaccount.google.com/permissions, find the Apps Script
+   project (it's named after your spreadsheet or "Untitled project"), and
+   click **Remove access**.
+3. Back in the editor, run `installTriggers`. Google will ask you to
+   authorise again — this time the list includes Google Calendar. Allow.
+4. Run `resync_calendar`, then `nightlyTidy`. The log should now show a
+   digest event being created.
+

@@ -31,11 +31,24 @@
  * "here's today" event instead of a wall of separate reminders. A
  * calendar hiccup of any kind must never stop a task from saving — see
  * syncTaskEvent_'s comment for how that's guaranteed.
+ *
+ * Phase 7 adds a weekly review: once a week, a short, warm, ALWAYS-KIND
+ * summary of the week just gone, plus a small handful of suggestions
+ * (what's worth doing this week, what could rest in Someday, what looks
+ * stale enough to drop) — never a count of everything still undone. It's
+ * written either by Gemini (automatically, Monday mornings, as a safety
+ * net) or by Claude (via a local scheduled task the owner sets up
+ * themselves — see tools/weekly-review/README.md — which is the better
+ * writer and always wins if both exist for the same week). The review
+ * lives in the Reviews tab as one JSON blob per week; see review_export,
+ * review_save, review_get, review_dismiss and review_apply below for the
+ * whole flow, and validateReview_ for the one rule that keeps a
+ * hallucinated task id or an overlong list from ever reaching the sheet.
  */
 
 // Bump this whenever you deploy a meaningfully different version. `ping`
 // returns it, so the phone/browser can show you which code it's talking to.
-const CODE_VERSION = "0.4.0";
+const CODE_VERSION = "0.5.0";
 
 // The app's own URL, used in calendar event descriptions ("Open: ...") so
 // a reminder always has a one-tap way back into the app.
@@ -149,6 +162,68 @@ const GEMINI_RESPONSE_SCHEMA = {
 };
 
 // ---------------------------------------------------------------------------
+// WEEKLY REVIEW CONSTANTS (Phase 7)
+// ---------------------------------------------------------------------------
+
+// How many tasks a review is allowed to suggest in each list. Kept small on
+// purpose — the whole point of a review is a handful of calm suggestions,
+// not a second backlog to feel bad about. validateReview_ enforces these no
+// matter what Gemini or Claude actually sent back.
+const REVIEW_MAX_SUGGESTED = 5;
+const REVIEW_MAX_SOMEDAY = 5;
+const REVIEW_MAX_DROP = 3;
+const REVIEW_MAX_WINS = 3;
+
+// A safety cap on the summary's length — not really a limit Gemini/Claude
+// should ever hit (they're asked for ≤3 sentences), just a backstop so one
+// runaway response can't bloat the Reviews sheet.
+const REVIEW_SUMMARY_MAX_CHARS = 900;
+
+// review_get treats a review as expired once its week_start is this many
+// days in the past — see isReviewFresh_. 10 days covers "the review from
+// last Monday, still unopened by the following Wednesday" without ever
+// showing a review for a week from a month ago.
+const REVIEW_FRESH_DAYS = 10;
+
+// The shape we ask Gemini for when writing a weekly review — mirrors the
+// shape validateReview_ expects (see that function's comment for the full
+// contract). generated_by isn't part of the schema; doReviewSave/
+// weeklyGeminiReview stamp that on afterwards, since it's not something
+// worth asking the model to get right.
+const REVIEW_RESPONSE_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    summary: { type: "STRING" },
+    wins: { type: "ARRAY", items: { type: "STRING" } },
+    suggested: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: { id: { type: "STRING" }, reason: { type: "STRING" } },
+        required: ["id", "reason"],
+      },
+    },
+    someday: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: { id: { type: "STRING" }, reason: { type: "STRING" } },
+        required: ["id", "reason"],
+      },
+    },
+    drop: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: { id: { type: "STRING" }, reason: { type: "STRING" } },
+        required: ["id", "reason"],
+      },
+    },
+  },
+  required: ["summary", "wins", "suggested", "someday", "drop"],
+};
+
+// ---------------------------------------------------------------------------
 // ROUTER
 // ---------------------------------------------------------------------------
 
@@ -165,6 +240,11 @@ const ACTIONS = {
   update: doUpdate,
   capture: doCapture,
   digest_preview: doDigestPreview,
+  review_export: doReviewExport,
+  review_save: doReviewSave,
+  review_get: doReviewGet,
+  review_dismiss: doReviewDismiss,
+  review_apply: doReviewApply,
 };
 
 /**
@@ -701,6 +781,12 @@ function syncTaskEvent_(sheet, headers, rowNum, task) {
 
   try {
     const desired = desiredEventState_(task);
+
+    // Most tasks have no due date and no event — nothing to do, so don't
+    // touch the Calendar service at all. (Google rate-limits calendar
+    // calls, and resync_calendar walks every row.)
+    if (!desired && !existingId) return "";
+
     const cal = getTasksCalendar_();
     let event = existingId ? cal.getEventById(existingId) : null;
 
@@ -816,8 +902,12 @@ function resync_calendar() {
     const task = rowToTask_(headers, values[i]);
     if (!task.id) continue;
     const before = task.calendar_event_id;
+    const touchesCalendar = !!before || !!desiredEventState_(task);
     const after = syncTaskEvent_(sheet, headers, i + 2, task);
     if (after !== before) changed++;
+    // Google refuses "too many calendar calls in a short time", so pause
+    // briefly after each row that actually talked to the calendar.
+    if (touchesCalendar) Utilities.sleep(500);
   }
 
   Logger.log("resync_calendar: checked " + values.length + " row(s), " + changed + " calendar_event_id value(s) changed.");
@@ -1026,16 +1116,521 @@ function buildDigestEvent_() {
 }
 
 // ---------------------------------------------------------------------------
-// TRIGGER INSTALLATION (Phase 6 — run these by hand, once, from the editor)
+// WEEKLY REVIEW (Phase 7)
+// ---------------------------------------------------------------------------
+//
+// The whole flow, end to end:
+//   1. review_export hands an outside reviewer (Gemini automatically, or
+//      Claude via the owner's own local scheduled task — see
+//      tools/weekly-review/) everything it needs to write a review: the
+//      open/recently-done tasks and the last 20 captures.
+//   2. review_save is how that review comes back and gets stored — always
+//      through validateReview_ first, so nothing malformed or hallucinated
+//      (an unknown task id, a 40-item list, a missing summary) ever reaches
+//      the sheet. Claude's review always wins over Gemini's for the same
+//      week — see the comment on doReviewSave for exactly how.
+//   3. review_get is what the app reads on load: the latest review that
+//      hasn't been dismissed and isn't stale (see isReviewFresh_).
+//   4. review_apply is what "Apply ticked" on the review card calls: it
+//      turns accepted suggestions into real task updates, the exact same
+//      way editing a task by hand would (applyUpdate_ + syncTaskEvent_),
+//      then dismisses the review so it doesn't show again.
+//   5. review_dismiss is "Not now" — the review just goes away; nothing
+//      about the tasks changes.
+
+/**
+ * Action `review_export`: everything an outside reviewer (Gemini or Claude)
+ * needs to write this week's review, and nothing more. Tasks are trimmed to
+ * just the fields a review might reasonably reason about (see the field
+ * list below) — not the whole Tasks2 row, which also has bookkeeping like
+ * calendar_event_id and op_id that a reviewer has no use for.
+ */
+function doReviewExport(request) {
+  const ss = getSpreadsheet_();
+  const sheet = ensureTabs_(ss);
+  const headers = getHeaders_(sheet);
+  const lastRow = sheet.getLastRow();
+  const today = todayString_();
+  const weekStart = mondayOf_(today);
+  const nowIso = nowIso_();
+
+  const allTasks = lastRow < 2
+    ? []
+    : rowsToTasks_(headers, sheet.getRange(2, 1, lastRow - 1, headers.length).getValues());
+
+  // Same "never show a dropped task" rule as doList, but done tasks get a
+  // longer window here (14 days, not DONE_VISIBLE_DAYS' 7) — a review looks
+  // back over the whole week, not just "what did I finish today".
+  const tasks = allTasks
+    .filter(function (t) {
+      if (!t.id) return false;
+      if (t.status === "dropped") return false;
+      if (t.status === "done") return isWithinLastNDays_(t.completed_at, 14, nowIso);
+      return true;
+    })
+    .map(function (t) {
+      return {
+        id: t.id,
+        title: t.title,
+        notes: t.notes,
+        category: t.category,
+        est_min: t.est_min,
+        status: t.status,
+        do_date: t.do_date,
+        due_date: t.due_date,
+        created_at: t.created_at,
+        completed_at: t.completed_at,
+        last_touched_at: t.last_touched_at,
+      };
+    });
+
+  const logSheet = ss.getSheetByName(LOG_SHEET_NAME);
+  const logHeaders = getHeaders_(logSheet);
+  const recentCaptures = lastLogRows_(logSheet, logHeaders, 20);
+
+  return { ok: true, week_start: weekStart, today: today, tasks: tasks, recent_captures: recentCaptures };
+}
+
+/**
+ * Action `review_save`: stores one week's review, keyed by week_start (one
+ * row per week — a second save for the same week overwrites the first,
+ * subject to the Claude-beats-Gemini rule below).
+ *
+ * Every review goes through validateReview_ FIRST, with the real list of
+ * known task ids, before it touches the sheet — this is what stops a
+ * reviewer's mistake (a made-up id, a list that's too long, a missing
+ * summary) from ever reaching what the app shows you.
+ *
+ * Claude overwrites Gemini; Gemini never overwrites Claude. Claude is the
+ * better writer (it's the owner's own subscription, prompted with the full
+ * conversation this task came from), so if it already wrote this week's
+ * review, the Monday-morning Gemini safety net backing off quietly is
+ * exactly right — see weeklyGeminiReview's own "already exists" check for
+ * the other half of this rule (it skips calling Gemini at all in that
+ * case; this check is what protects the sheet even if that skip is ever
+ * bypassed, e.g. a manual test run).
+ */
+function doReviewSave(request) {
+  const payload = request.payload || {};
+  const weekStart = String(payload.week_start || "").trim();
+  const source = (payload.source === "claude" || payload.source === "gemini") ? payload.source : "";
+
+  if (!validDate_(weekStart)) return { ok: false, error: "invalid_week_start" };
+  if (!source) return { ok: false, error: "invalid_source" };
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const ss = getSpreadsheet_();
+    const tasksSheet = ensureTabs_(ss);
+    const tasksHeaders = getHeaders_(tasksSheet);
+    const knownIds = collectIds_(tasksSheet, tasksHeaders);
+
+    const validated = validateReview_(payload.review, knownIds);
+    if (!validated.ok) return { ok: false, error: validated.error };
+
+    const reviewsSheet = ss.getSheetByName(REVIEWS_SHEET_NAME);
+    const reviewsHeaders = getHeaders_(reviewsSheet);
+    const existingRowNum = findReviewRow_(reviewsSheet, reviewsHeaders, weekStart);
+
+    if (existingRowNum) {
+      const sourceCol = reviewsHeaders.indexOf("source");
+      const existingSource = String(reviewsSheet.getRange(existingRowNum, sourceCol + 1).getValue() || "");
+      if (existingSource === "claude" && source === "gemini") {
+        return { ok: true, skipped: "claude_review_exists" };
+      }
+    }
+
+    const rowObj = {
+      week_start: weekStart,
+      source: source,
+      created_at: nowIso_(),
+      json: JSON.stringify(validated.review),
+      dismissed_at: "",
+    };
+    const values = reviewsHeaders.map(function (h) { return rowObj[h] !== undefined ? rowObj[h] : ""; });
+
+    if (existingRowNum) {
+      reviewsSheet.getRange(existingRowNum, 1, 1, reviewsHeaders.length).setValues([values]);
+    } else {
+      reviewsSheet.appendRow(values);
+    }
+
+    return { ok: true, week_start: weekStart, source: source };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Action `review_get`: the review the app should show right now, or null.
+ * "Right now" means the most recent (by week_start) row that hasn't been
+ * dismissed AND isn't stale (see isReviewFresh_) — so a review you never
+ * got round to opening quietly stops being offered after about a week and
+ * a half, rather than an old "your week reviewed" card confusingly
+ * reappearing a month later.
+ */
+function doReviewGet(request) {
+  const ss = getSpreadsheet_();
+  const sheet = ss.getSheetByName(REVIEWS_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) return { ok: true, review: null };
+
+  const headers = getHeaders_(sheet);
+  const lastRow = sheet.getLastRow();
+  const values = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  const weekStartCol = headers.indexOf("week_start");
+  const sourceCol = headers.indexOf("source");
+  const createdCol = headers.indexOf("created_at");
+  const jsonCol = headers.indexOf("json");
+  const dismissedCol = headers.indexOf("dismissed_at");
+  const today = todayString_();
+
+  let best = null;
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
+    const weekStart = String(row[weekStartCol] || "");
+    if (!weekStart) continue;
+    if (String(row[dismissedCol] || "")) continue; // dismissed — never offered again
+    if (!isReviewFresh_(weekStart, today)) continue;
+    if (!best || weekStart > best.weekStart) {
+      best = {
+        weekStart: weekStart,
+        source: String(row[sourceCol] || ""),
+        createdAt: String(row[createdCol] || ""),
+        json: String(row[jsonCol] || ""),
+      };
+    }
+  }
+  if (!best) return { ok: true, review: null };
+
+  let parsed;
+  try {
+    parsed = JSON.parse(best.json);
+  } catch (err) {
+    return { ok: true, review: null }; // corrupt row — treat exactly like "no review" rather than erroring the app
+  }
+
+  return {
+    ok: true,
+    review: Object.assign({}, parsed, {
+      week_start: best.weekStart,
+      source: best.source,
+      created_at: best.createdAt,
+    }),
+  };
+}
+
+/** Action `review_dismiss`: "Not now" — marks this week's review row as
+ * dismissed (review_get will never offer it again) without touching a
+ * single task. Silently a no-op if that week's review doesn't exist any
+ * more, since "dismiss something already gone" isn't really an error. */
+function doReviewDismiss(request) {
+  const payload = request.payload || {};
+  const weekStart = String(payload.week_start || "").trim();
+  if (!weekStart) return { ok: false, error: "missing_week_start" };
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const ss = getSpreadsheet_();
+    const sheet = ss.getSheetByName(REVIEWS_SHEET_NAME);
+    if (!sheet) return { ok: true };
+    const headers = getHeaders_(sheet);
+    const rowNum = findReviewRow_(sheet, headers, weekStart);
+    if (!rowNum) return { ok: true };
+    const dismissedCol = headers.indexOf("dismissed_at");
+    if (dismissedCol !== -1) sheet.getRange(rowNum, dismissedCol + 1).setValue(nowIso_());
+    return { ok: true };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Action `review_apply`: "Apply ticked" on the review card. Turns whichever
+ * suggestion ids the person actually ticked into real task changes — a
+ * suggested task goes onto today, a someday one is parked, a drop one is
+ * dropped — using the exact same applyUpdate_ + syncTaskEvent_ path a
+ * normal edit uses, so a calendar reminder appears/disappears correctly
+ * and nothing about "what counts as a valid update" is duplicated here.
+ * Then dismisses the review, all under one lock, so the review can never
+ * end up half-applied-and-still-showing if something goes wrong partway.
+ */
+function doReviewApply(request) {
+  const payload = request.payload || {};
+  const weekStart = String(payload.week_start || "").trim();
+  const accept = (payload.accept && typeof payload.accept === "object") ? payload.accept : {};
+  const suggestedIds = Array.isArray(accept.suggested) ? accept.suggested.map(String) : [];
+  const somedayIds = Array.isArray(accept.someday) ? accept.someday.map(String) : [];
+  const dropIds = Array.isArray(accept.drop) ? accept.drop.map(String) : [];
+
+  const today = todayString_();
+  const nowIso = nowIso_();
+  const updatedTasks = [];
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const ss = getSpreadsheet_();
+    const sheet = ensureTabs_(ss);
+    const headers = getHeaders_(sheet);
+    const idIndex = buildIdIndex_(sheet, headers);
+
+    function applyFields(id, fields) {
+      const rowNum = idIndex[id];
+      if (!rowNum) return; // unknown id (e.g. task dropped since the review was written) — skip, don't fail the whole apply
+
+      const rowValues = sheet.getRange(rowNum, 1, 1, headers.length).getValues()[0];
+      const existingTask = rowToTask_(headers, rowValues);
+      const result = applyUpdate_(existingTask, fields, nowIso);
+      if (!result.ok) return;
+
+      sheet.getRange(rowNum, 1, 1, headers.length).setValues([taskToRowValues_(headers, result.task)]);
+      result.task.calendar_event_id = syncTaskEvent_(sheet, headers, rowNum, result.task);
+      updatedTasks.push(rowToTask_(headers, taskToRowValues_(headers, result.task)));
+    }
+
+    for (let i = 0; i < suggestedIds.length; i++) applyFields(suggestedIds[i], { status: "active", do_date: today });
+    for (let i = 0; i < somedayIds.length; i++) applyFields(somedayIds[i], { status: "someday", do_date: "" });
+    for (let i = 0; i < dropIds.length; i++) applyFields(dropIds[i], { status: "dropped" });
+
+    if (weekStart) {
+      const reviewsSheet = ss.getSheetByName(REVIEWS_SHEET_NAME);
+      if (reviewsSheet) {
+        const reviewsHeaders = getHeaders_(reviewsSheet);
+        const reviewRowNum = findReviewRow_(reviewsSheet, reviewsHeaders, weekStart);
+        if (reviewRowNum) {
+          const dismissedCol = reviewsHeaders.indexOf("dismissed_at");
+          if (dismissedCol !== -1) reviewsSheet.getRange(reviewRowNum, dismissedCol + 1).setValue(nowIso);
+        }
+      }
+    }
+
+    return { ok: true, tasks: updatedTasks };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// --- weekly review — sheet-access helpers (not pure) -----------------------
+
+/** Finds the Reviews row for a given week_start, or null. There's meant to
+ * be at most one row per week (doReviewSave always upserts), but this scans
+ * rather than assumes, so a duplicate created by hand doesn't crash — it
+ * just finds the first match. */
+function findReviewRow_(sheet, headers, weekStart) {
+  const lastRow = sheet.getLastRow();
+  const weekStartCol = headers.indexOf("week_start");
+  if (weekStartCol === -1 || lastRow < 2) return null;
+
+  const values = sheet.getRange(2, weekStartCol + 1, lastRow - 1, 1).getValues();
+  for (let i = 0; i < values.length; i++) {
+    if (String(values[i][0] || "") === weekStart) return i + 2;
+  }
+  return null;
+}
+
+/** Every non-blank id currently in Tasks2 — what validateReview_ checks a
+ * reviewer's suggested/someday/drop ids against, so a hallucinated or
+ * long-dropped id can never sneak into what the review card shows. */
+function collectIds_(sheet, headers) {
+  const idCol = headers.indexOf("id");
+  const lastRow = sheet.getLastRow();
+  if (idCol === -1 || lastRow < 2) return [];
+
+  const values = sheet.getRange(2, idCol + 1, lastRow - 1, 1).getValues();
+  const ids = [];
+  for (let i = 0; i < values.length; i++) {
+    const id = String(values[i][0] || "");
+    if (id) ids.push(id);
+  }
+  return ids;
+}
+
+/** The last `n` rows of the Log tab (oldest of the n first), as plain
+ * {at, raw_text} objects — what review_export hands a reviewer as "recent
+ * captures", so it has a feel for what's been on your mind this week even
+ * for stuff that never made it into Tasks2 as-is (e.g. a fallback capture
+ * later dropped, or just extra context in a ramble). */
+function lastLogRows_(sheet, headers, n) {
+  const lastRow = sheet.getLastRow();
+  if (!sheet || lastRow < 2) return [];
+
+  const total = lastRow - 1;
+  const count = Math.min(n, total);
+  const startRow = lastRow - count + 1;
+  const atCol = headers.indexOf("at");
+  const rawCol = headers.indexOf("raw_text");
+
+  const values = sheet.getRange(startRow, 1, count, headers.length).getValues();
+  return values.map(function (row) {
+    return {
+      at: atCol !== -1 ? String(row[atCol] || "") : "",
+      raw_text: rawCol !== -1 ? String(row[rawCol] || "") : "",
+    };
+  });
+}
+
+// --- weekly review — Gemini call (Monday-morning safety net) ---------------
+
+/**
+ * Builds the prompt sent to Gemini for the weekly review. Pure (no Apps
+ * Script API calls) so it — like buildGeminiPrompt_ — is easy to reason
+ * about and could be lifted into a plain-node test the same way that one's
+ * tested, even though runTests() doesn't currently check its exact text.
+ */
+function buildReviewPrompt_(tasks, recentCaptures, weekStart, todayStr) {
+  return (
+    "You are a kind, practical weekly-review coach for someone with ADHD. " +
+    "Today's date is " + todayStr + "; this review covers the week starting " + weekStart + ".\n\n" +
+    "Given their tasks and recent captures, write a short warm summary of the past week " +
+    "(mention 1-3 concrete wins from completed tasks), pick up to 5 tasks worth doing this " +
+    "week (prefer: due soon, quick wins, things touched recently), up to 5 that could rest " +
+    "in Someday, up to 3 that look stale or duplicated to drop. Never scold, never mention " +
+    "how many tasks are open or overdue. Use only the ids given.\n\n" +
+    "Respond with JSON matching the schema: summary (string, at most 3 sentences), " +
+    "wins (array of short strings), suggested/someday/drop (arrays of {id, reason}, " +
+    "reason is one short phrase).\n\n" +
+    "Tasks (JSON):\n" + JSON.stringify(tasks) + "\n\n" +
+    "Recent captures (JSON):\n" + JSON.stringify(recentCaptures)
+  );
+}
+
+/**
+ * Calls Gemini to write one weekly review. Same defensive shape as
+ * callGemini_ (muteHttpExceptions so a Gemini-side error comes back as
+ * readable text, a forced JSON responseSchema so there's no free-form text
+ * to guess-parse) — throws a short error on any failure, which
+ * weeklyGeminiReview catches and just logs (see that function's comment
+ * for why there's no fallback review, unlike capture's fallback task).
+ */
+function callGeminiForReview_(tasks, recentCaptures, weekStart, todayStr) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  if (!apiKey) throw new Error("missing_gemini_key");
+
+  const model = PropertiesService.getScriptProperties().getProperty("GEMINI_MODEL") || GEMINI_MODEL_DEFAULT;
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent";
+  const prompt = buildReviewPrompt_(tasks, recentCaptures, weekStart, todayStr);
+
+  const requestBody = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: REVIEW_RESPONSE_SCHEMA,
+      temperature: 0.3,
+    },
+  };
+
+  const response = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    headers: { "x-goog-api-key": apiKey },
+    payload: JSON.stringify(requestBody),
+    muteHttpExceptions: true,
+  });
+
+  const status = response.getResponseCode();
+  if (status !== 200) {
+    throw new Error("gemini_http_" + status + ": " + response.getContentText().slice(0, 200));
+  }
+
+  let envelope;
+  try {
+    envelope = JSON.parse(response.getContentText());
+  } catch (err) {
+    throw new Error("gemini_bad_json_envelope");
+  }
+
+  const text = envelope && envelope.candidates && envelope.candidates[0] &&
+    envelope.candidates[0].content && envelope.candidates[0].content.parts &&
+    envelope.candidates[0].content.parts[0] && envelope.candidates[0].content.parts[0].text;
+  if (!text) throw new Error("gemini_no_text_in_response");
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error("gemini_bad_json_review");
+  }
+
+  return Object.assign({}, parsed, { generated_by: "gemini" });
+}
+
+/**
+ * Runs automatically Monday mornings (see installTriggers()). If Claude
+ * already wrote this week's review (via the owner's own local scheduled
+ * task — see tools/weekly-review/), this is a deliberate no-op: Claude is
+ * the better writer, and calling Gemini anyway would just waste a call and
+ * risk doReviewSave's own Claude-beats-Gemini check silently discarding it.
+ * Otherwise, builds the same export the app itself would ask for, asks
+ * Gemini to review it, and saves the result with source "gemini" — going
+ * through doReviewSave, so it gets exactly the same validateReview_ safety
+ * check as any other save.
+ *
+ * On ANY failure (no API key, Gemini down, a reply that fails validation)
+ * this just logs and stops — deliberately no fallback review. Unlike a
+ * capture, where losing the raw text would be a real loss, a missing
+ * review this week is just... no review this week. Next Monday tries
+ * again, and the review card simply doesn't appear until then.
+ *
+ * You can also run this by hand from the editor (function dropdown →
+ * `weeklyGeminiReview` → Run) to see it work without waiting for Monday —
+ * see docs/RUNBOOK.md section L.
+ */
+function weeklyGeminiReview() {
+  try {
+    const today = todayString_();
+    const weekStart = mondayOf_(today);
+
+    const ss = getSpreadsheet_();
+    const reviewsSheet = ensureTab_(ss, REVIEWS_SHEET_NAME, REVIEWS_HEADERS);
+    const reviewsHeaders = getHeaders_(reviewsSheet);
+    const existingRowNum = findReviewRow_(reviewsSheet, reviewsHeaders, weekStart);
+    if (existingRowNum) {
+      const sourceCol = reviewsHeaders.indexOf("source");
+      const existingSource = String(reviewsSheet.getRange(existingRowNum, sourceCol + 1).getValue() || "");
+      if (existingSource === "claude") {
+        Logger.log("weeklyGeminiReview: a Claude review already exists for week " + weekStart + " — skipping.");
+        return;
+      }
+    }
+
+    const exportResult = doReviewExport({});
+
+    let reviewJson;
+    try {
+      reviewJson = callGeminiForReview_(exportResult.tasks, exportResult.recent_captures, weekStart, today);
+    } catch (err) {
+      Logger.log("weeklyGeminiReview: Gemini call failed (" + errorMessage_(err) + ") — no fallback review is written.");
+      return;
+    }
+
+    const saveResult = doReviewSave({ payload: { week_start: weekStart, source: "gemini", review: reviewJson } });
+    if (!saveResult.ok) {
+      Logger.log("weeklyGeminiReview: Gemini's review failed validation (" + saveResult.error + ") — not saved.");
+      return;
+    }
+    Logger.log(
+      "weeklyGeminiReview: " +
+      (saveResult.skipped ? "skipped (" + saveResult.skipped + ")" : "saved a Gemini review") +
+      " for week " + weekStart + "."
+    );
+  } catch (err) {
+    Logger.log("weeklyGeminiReview failed: " + errorMessage_(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TRIGGER INSTALLATION (Phase 6/7 — run these by hand, once, from the editor)
 // ---------------------------------------------------------------------------
 
 /**
- * Turns on the nightly tidy. Run once by hand (function dropdown →
- * `installTriggers` → Run) — see docs/RUNBOOK.md section K. Always removes
- * any existing nightlyTidy trigger first, so running this twice by
- * accident can never create a duplicate (which would otherwise mean the
- * whole tidy — and the digest delete/recreate inside it — running twice
- * every night).
+ * Turns on the nightly tidy AND the weekly review. Run once by hand
+ * (function dropdown → `installTriggers` → Run) — see docs/RUNBOOK.md
+ * sections K and L. Always removes any existing triggers of either kind
+ * first, so running this twice by accident can never create a duplicate
+ * (which would otherwise mean nightlyTidy, or the Gemini review call,
+ * running twice).
  *
  * Apps Script time-based triggers don't fire at an exact minute:
  * `atHour(3)` means "some time in the 3:00–3:15am window", not "at exactly
@@ -1044,21 +1639,27 @@ function buildDigestEvent_() {
 function installTriggers() {
   removeTriggers();
   ScriptApp.newTrigger("nightlyTidy").timeBased().everyDays(1).atHour(3).create();
-  Logger.log("Installed the nightly tidy trigger — it'll fire roughly once a day between 3:00 and 3:15am.");
+  ScriptApp.newTrigger("weeklyGeminiReview").timeBased().onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(8).create();
+  Logger.log(
+    "Installed the nightly tidy trigger (roughly 3:00–3:15am daily) and the " +
+    "weekly review trigger (roughly 8:00–8:15am Mondays)."
+  );
 }
 
-/** Turns the nightly tidy back off. Run by hand (function dropdown →
- * `removeTriggers` → Run) if you ever want to pause it. */
+/** Turns the nightly tidy and the weekly review trigger back off. Run by
+ * hand (function dropdown → `removeTriggers` → Run) if you ever want to
+ * pause either. */
 function removeTriggers() {
   const triggers = ScriptApp.getProjectTriggers();
   let removed = 0;
   for (let i = 0; i < triggers.length; i++) {
-    if (triggers[i].getHandlerFunction() === "nightlyTidy") {
+    const fn = triggers[i].getHandlerFunction();
+    if (fn === "nightlyTidy" || fn === "weeklyGeminiReview") {
       ScriptApp.deleteTrigger(triggers[i]);
       removed++;
     }
   }
-  Logger.log("Removed " + removed + " existing nightlyTidy trigger(s).");
+  Logger.log("Removed " + removed + " existing trigger(s) (nightlyTidy/weeklyGeminiReview).");
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,6 +1942,110 @@ function buildFallbackTask_(raw, id, nowIso) {
     source: "fallback",
     raw_input: rawStr,
     op_id: "", // filled in by doCapture from the top-level payload
+  };
+}
+
+// --- Weekly review (Phase 7) — pure helpers ---------------------------------
+// Like buildGeminiPrompt_/parseGeminiTasks_ above, these three are kept free
+// of any Apps Script-only API (no Utilities, no SpreadsheetApp, no Date
+// formatting that depends on the script's timezone) — that's what makes
+// them the ones the verification steps for this phase can copy into a
+// plain .mjs file and run under plain `node`, and what runTests() checks
+// directly.
+
+/**
+ * PURE: the Monday (YYYY-MM-DD) of the week containing `dateStr`. This is
+ * what "week_start" means everywhere in this app — review_export uses it to
+ * label the current week, and doReviewSave/doReviewGet key every review row
+ * by it. Works in local calendar terms (no Apps Script timezone API), which
+ * is fine here because it's only ever called with a YYYY-MM-DD that's
+ * already in the right timezone (todayString_()'s output).
+ */
+function mondayOf_(dateStr) {
+  const parts = String(dateStr).split("-").map(Number);
+  const d = new Date(parts[0], parts[1] - 1, parts[2]);
+  const day = d.getDay(); // 0 = Sunday, 1 = Monday, ... 6 = Saturday
+  const diff = day === 0 ? -6 : 1 - day; // days to step back (or forward, for Sunday) to reach Monday
+  d.setDate(d.getDate() + diff);
+
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return y + "-" + m + "-" + dd;
+}
+
+/**
+ * PURE: whether a review with this week_start should still be offered
+ * today, or has quietly expired (see REVIEW_FRESH_DAYS' comment for why
+ * that's a kindness, not a bug). A missing week_start or today is never
+ * "fresh" — there's nothing to compare.
+ */
+function isReviewFresh_(weekStart, todayStr) {
+  if (!weekStart || !todayStr) return false;
+  const wsParts = String(weekStart).split("-").map(Number);
+  const tParts = String(todayStr).split("-").map(Number);
+  if (wsParts.length !== 3 || tParts.length !== 3) return false;
+
+  const ws = new Date(wsParts[0], wsParts[1] - 1, wsParts[2]);
+  const t = new Date(tParts[0], tParts[1] - 1, tParts[2]);
+  const diffDays = Math.round((t - ws) / 86400000);
+  return diffDays <= REVIEW_FRESH_DAYS;
+}
+
+/**
+ * PURE: the one gate every review (Gemini's or Claude's) has to pass before
+ * it can be saved. Only a missing/blank summary rejects the whole review
+ * outright — everything else is "best effort", the same philosophy
+ * validateNewTask_ uses for a task: an id that isn't in `knownIds` (a
+ * hallucinated id, or one for a task that's since been dropped) is quietly
+ * dropped from its list rather than failing the save, and every list is
+ * clamped to its max length rather than rejected for being too long. This
+ * is what makes it safe to trust an LLM's output directly, with no human
+ * in the loop before it reaches the sheet.
+ *
+ * `knownIds` can be a plain array or a Set — either works, since this only
+ * ever calls `.has()` on it after normalising.
+ */
+function validateReview_(review, knownIds) {
+  if (!review || typeof review !== "object") return { ok: false, error: "missing_review" };
+
+  const summary = String(review.summary || "").trim();
+  if (!summary) return { ok: false, error: "missing_summary" };
+
+  const knownIdSet = knownIds instanceof Set ? knownIds : new Set(Array.isArray(knownIds) ? knownIds : []);
+
+  const wins = (Array.isArray(review.wins) ? review.wins : [])
+    .map(function (w) { return String(w || "").trim(); })
+    .filter(function (w) { return w.length > 0; })
+    .slice(0, REVIEW_MAX_WINS);
+
+  function cleanIdList(list, max) {
+    const out = [];
+    if (!Array.isArray(list)) return out;
+    for (let i = 0; i < list.length && out.length < max; i++) {
+      const item = list[i];
+      if (!item || typeof item !== "object") continue;
+      const id = String(item.id || "").trim();
+      if (!id || !knownIdSet.has(id)) continue; // drops an unknown/hallucinated/no-longer-real id
+      out.push({ id: id, reason: String(item.reason || "").trim() });
+    }
+    return out;
+  }
+
+  const generatedBy = (review.generated_by === "claude" || review.generated_by === "gemini")
+    ? review.generated_by
+    : "gemini";
+
+  return {
+    ok: true,
+    review: {
+      summary: summary.slice(0, REVIEW_SUMMARY_MAX_CHARS),
+      wins: wins,
+      suggested: cleanIdList(review.suggested, REVIEW_MAX_SUGGESTED),
+      someday: cleanIdList(review.someday, REVIEW_MAX_SOMEDAY),
+      drop: cleanIdList(review.drop, REVIEW_MAX_DROP),
+      generated_by: generatedBy,
+    },
   };
 }
 
@@ -1882,6 +2587,23 @@ function runTests() {
   test_buildDigestText_empty_(results);
   test_buildDigestText_truncatesOverEight_(results);
 
+  test_mondayOf_onAMonday_(results);
+  test_mondayOf_midWeek_(results);
+  test_mondayOf_onASunday_(results);
+
+  test_isReviewFresh_withinWindow_(results);
+  test_isReviewFresh_exactlyAtWindow_(results);
+  test_isReviewFresh_expiredPastWindow_(results);
+  test_isReviewFresh_blankWeekStartIsNotFresh_(results);
+
+  test_validateReview_requiresSummary_(results);
+  test_validateReview_happyPath_(results);
+  test_validateReview_dropsUnknownIds_(results);
+  test_validateReview_clampsListLengths_(results);
+  test_validateReview_clampsWinsTo3_(results);
+  test_validateReview_defaultsGeneratedBy_(results);
+  test_validateReview_acceptsArrayOrSetForKnownIds_(results);
+
   const failed = results.filter(function (r) { return !r.pass; });
   Logger.log(results.map(function (r) {
     return (r.pass ? "PASS: " : "FAIL: ") + r.name;
@@ -2364,4 +3086,121 @@ function test_buildDigestText_truncatesOverEight_(results) {
     bulletLines.length === 8);
   assert_(results, "buildDigestText_ adds an '…and more' line when truncating",
     text.description.indexOf("…and more") !== -1);
+}
+
+// --- Phase 7: mondayOf_ ------------------------------------------------
+
+function test_mondayOf_onAMonday_(results) {
+  assert_(results, "mondayOf_ of a Monday is itself",
+    mondayOf_("2026-01-05") === "2026-01-05");
+}
+
+function test_mondayOf_midWeek_(results) {
+  assert_(results, "mondayOf_ of a Thursday is that week's Monday",
+    mondayOf_("2026-01-08") === "2026-01-05");
+}
+
+function test_mondayOf_onASunday_(results) {
+  assert_(results, "mondayOf_ of a Sunday is the Monday that started that week (not next Monday)",
+    mondayOf_("2026-01-11") === "2026-01-05");
+}
+
+// --- Phase 7: isReviewFresh_ --------------------------------------------
+
+function test_isReviewFresh_withinWindow_(results) {
+  assert_(results, "isReviewFresh_ treats a week_start well within the window as fresh",
+    isReviewFresh_("2026-01-05", "2026-01-08") === true);
+}
+
+function test_isReviewFresh_exactlyAtWindow_(results) {
+  assert_(results, "isReviewFresh_ treats exactly REVIEW_FRESH_DAYS days old as still fresh",
+    isReviewFresh_("2026-01-01", "2026-01-11") === true);
+}
+
+function test_isReviewFresh_expiredPastWindow_(results) {
+  assert_(results, "isReviewFresh_ treats more than REVIEW_FRESH_DAYS days old as expired",
+    isReviewFresh_("2026-01-01", "2026-01-12") === false);
+}
+
+function test_isReviewFresh_blankWeekStartIsNotFresh_(results) {
+  assert_(results, "isReviewFresh_ treats a blank week_start as not fresh",
+    isReviewFresh_("", "2026-01-11") === false);
+}
+
+// --- Phase 7: validateReview_ -------------------------------------------
+
+function test_validateReview_requiresSummary_(results) {
+  const result = validateReview_({ summary: "   " }, ["t1"]);
+  assert_(results, "validateReview_ rejects a blank/missing summary",
+    result.ok === false && result.error === "missing_summary");
+}
+
+function test_validateReview_happyPath_(results) {
+  const result = validateReview_({
+    summary: "A calm, steady week — you kept on top of the essentials.",
+    wins: ["Paid the electric bill", "Booked the dentist"],
+    suggested: [{ id: "t1", reason: "due soon" }],
+    someday: [{ id: "t2", reason: "not urgent" }],
+    drop: [{ id: "t3", reason: "looks like a duplicate" }],
+    generated_by: "claude",
+  }, ["t1", "t2", "t3"]);
+  assert_(results, "validateReview_ accepts a well-formed review as-is",
+    result.ok === true &&
+    result.review.summary.indexOf("calm, steady week") !== -1 &&
+    result.review.wins.length === 2 &&
+    result.review.suggested.length === 1 && result.review.suggested[0].id === "t1" &&
+    result.review.someday.length === 1 && result.review.someday[0].id === "t2" &&
+    result.review.drop.length === 1 && result.review.drop[0].id === "t3" &&
+    result.review.generated_by === "claude");
+}
+
+function test_validateReview_dropsUnknownIds_(results) {
+  const result = validateReview_({
+    summary: "A quiet week.",
+    suggested: [{ id: "known-1", reason: "due soon" }, { id: "made-up-id", reason: "hallucinated" }],
+  }, ["known-1"]);
+  assert_(results, "validateReview_ drops an id that isn't in the known task list",
+    result.ok === true && result.review.suggested.length === 1 && result.review.suggested[0].id === "known-1");
+}
+
+function test_validateReview_clampsListLengths_(results) {
+  function many(n) {
+    const out = [];
+    for (let i = 0; i < n; i++) out.push({ id: "id-" + i, reason: "r" });
+    return out;
+  }
+  const knownIds = [];
+  for (let i = 0; i < 10; i++) knownIds.push("id-" + i);
+
+  const result = validateReview_({
+    summary: "Plenty going on this week.",
+    suggested: many(10),
+    someday: many(10),
+    drop: many(10),
+  }, knownIds);
+  assert_(results, "validateReview_ clamps suggested/someday to 5 and drop to 3",
+    result.ok === true &&
+    result.review.suggested.length === REVIEW_MAX_SUGGESTED &&
+    result.review.someday.length === REVIEW_MAX_SOMEDAY &&
+    result.review.drop.length === REVIEW_MAX_DROP);
+}
+
+function test_validateReview_clampsWinsTo3_(results) {
+  const result = validateReview_({ summary: "Good week.", wins: ["a", "b", "c", "d", "e"] }, []);
+  assert_(results, "validateReview_ clamps wins to 3",
+    result.ok === true && result.review.wins.length === REVIEW_MAX_WINS);
+}
+
+function test_validateReview_defaultsGeneratedBy_(results) {
+  const result = validateReview_({ summary: "Fine week.", generated_by: "not_a_real_value" }, []);
+  assert_(results, "validateReview_ defaults an unrecognised generated_by to gemini",
+    result.ok === true && result.review.generated_by === "gemini");
+}
+
+function test_validateReview_acceptsArrayOrSetForKnownIds_(results) {
+  const viaArray = validateReview_({ summary: "Ok.", suggested: [{ id: "t1", reason: "r" }] }, ["t1"]);
+  const viaSet = validateReview_({ summary: "Ok.", suggested: [{ id: "t1", reason: "r" }] }, new Set(["t1"]));
+  assert_(results, "validateReview_ works with knownIds passed as a plain array or as a Set",
+    viaArray.ok === true && viaArray.review.suggested.length === 1 &&
+    viaSet.ok === true && viaSet.review.suggested.length === 1);
 }

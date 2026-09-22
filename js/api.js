@@ -110,6 +110,18 @@ function isMockFallbackForced() {
   }
 }
 
+/** `?mock=1&review=1` seeds a sample weekly review (as if Claude had
+ * already written one), so the review card can be seen and clicked through
+ * without a real backend or waiting for Monday. Without it, review_get
+ * just returns null, same as "no review yet" on a real server. */
+function isMockReviewSeeded() {
+  try {
+    return new URLSearchParams(window.location.search).get("review") === "1";
+  } catch (err) {
+    return false;
+  }
+}
+
 // --- the real network call ------------------------------------------------
 
 async function realCall(action, payload) {
@@ -255,6 +267,87 @@ function mockUpdate(tasks, payload) {
   return { ok: true, task: cloneTask(task) };
 }
 
+// --- fake weekly review (mock review_get/apply/dismiss) -----------------
+// A believable sample review, referencing a few of seedMockTasks()'s own
+// ids, so "Apply ticked" has something real to act on and titles actually
+// resolve. `undefined` means "not decided yet" (seed on first ask, once);
+// `null` means "no review" — either never seeded, or already applied/
+// dismissed this session.
+
+let mockReview; // undefined until ensureMockReview()'s first call
+
+function mondayOfMock_(dateStr) {
+  const parts = String(dateStr).split("-").map(Number);
+  const d = new Date(parts[0], parts[1] - 1, parts[2]);
+  const day = d.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diff);
+  return isoDate_(d);
+}
+
+function isoDate_(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return y + "-" + m + "-" + dd;
+}
+
+function seedMockReview() {
+  const today = todayStr();
+  return {
+    week_start: mondayOfMock_(today),
+    source: "claude",
+    created_at: new Date().toISOString(),
+    summary: "A steady week — you kept on top of the small stuff without letting it pile up. Nice and calm.",
+    wins: ["Kept up the morning stretch routine", "Replied to Sam about the weekend"],
+    suggested: [
+      { id: "seed-9", reason: "a gift takes some planning — worth getting ahead of it" },
+      { id: "seed-11", reason: "a quick 10-minute tidy" },
+    ],
+    someday: [
+      { id: "seed-3", reason: "no rush — a nice one to dream about later" },
+      { id: "seed-4", reason: "whenever you feel like it, not urgent" },
+    ],
+    drop: [
+      { id: "seed-14", reason: "sat unsorted a while — might not matter any more" },
+    ],
+    generated_by: "claude",
+  };
+}
+
+function ensureMockReview() {
+  if (mockReview === undefined) {
+    mockReview = isMockReviewSeeded() ? seedMockReview() : null;
+  }
+  return mockReview;
+}
+
+function mockReviewApply(tasks, payload) {
+  const accept = (payload && payload.accept && typeof payload.accept === "object") ? payload.accept : {};
+  const today = todayStr();
+  const now = new Date().toISOString();
+  const updated = [];
+
+  function applyOne(id, fields) {
+    const task = tasks.find(function (t) { return t.id === id; });
+    if (!task) return;
+    Object.assign(task, fields, { updated_at: now });
+    if (task.status === "done") task.completed_at = task.completed_at || now;
+    if (task.status !== "done") task.completed_at = "";
+    updated.push(cloneTask(task));
+  }
+
+  const suggestedIds = Array.isArray(accept.suggested) ? accept.suggested : [];
+  const somedayIds = Array.isArray(accept.someday) ? accept.someday : [];
+  const dropIds = Array.isArray(accept.drop) ? accept.drop : [];
+  for (const id of suggestedIds) applyOne(id, { status: "active", do_date: today });
+  for (const id of somedayIds) applyOne(id, { status: "someday", do_date: "" });
+  for (const id of dropIds) applyOne(id, { status: "dropped" });
+
+  mockReview = null;
+  return { ok: true, tasks: updated };
+}
+
 // --- fake brain-dump splitter (mock capture) --------------------------
 // A rough stand-in for what Gemini does server-side: cut the ramble into
 // pieces on the obvious separators, and guess a category from a few
@@ -366,6 +459,9 @@ async function mockCall(action, payload) {
     await delay(900 + Math.random() * 300);
     return mockCapture(tasks, payload);
   }
+  if (action === "review_get") return { ok: true, review: ensureMockReview() };
+  if (action === "review_dismiss") { mockReview = null; return { ok: true }; }
+  if (action === "review_apply") return mockReviewApply(tasks, payload);
   return { ok: false, error: "unknown_action" };
 }
 

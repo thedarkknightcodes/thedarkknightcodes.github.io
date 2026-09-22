@@ -48,6 +48,12 @@ const state = {
   syncStatus: "idle", // "idle" | "saving" | "retry"
   needsMigration: false,
   lastSync: Number(readJson(LAST_SYNC_KEY, 0)) || 0,
+  // Phase 7: this week's review, or null if there isn't one to show right
+  // now. Deliberately NOT cached in localStorage like tasks are — it's
+  // fetched fresh on every load (see app.js's fetchReview), so a stale
+  // review from days ago never lingers just because the device was
+  // offline for a bit.
+  review: null,
 };
 
 const listeners = new Set();
@@ -109,6 +115,17 @@ export function setServerMeta(meta) {
 
 export function setSyncStatus(status) {
   state.syncStatus = status;
+  notify();
+}
+
+// --- weekly review (Phase 7) --------------------------------------------
+
+/** Sets (or clears, with null/undefined) the review the Today screen
+ * should offer right now. app.js sets this straight to null the moment
+ * "Apply ticked" or "Not now" is pressed — the card should disappear
+ * immediately, not wait for the server round-trip to confirm. */
+export function setReview(review) {
+  state.review = review || null;
   notify();
 }
 
