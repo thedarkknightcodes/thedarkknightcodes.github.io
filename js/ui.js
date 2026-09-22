@@ -17,6 +17,7 @@
 
 export { openActionSheet, openSettingsSheet, updateSettingsInfo, closeSettings } from "./sheets.js";
 import { renderReview } from "./review.js";
+import { sourceBadge } from "./logic.js";
 
 const refs = {};
 let toastTimer = null;
@@ -193,6 +194,11 @@ function buildTaskRow(task, opts, handlers) {
   if (task.category && task.category !== "Inbox") bits.push(task.category);
   if (task.est_min) bits.push(task.est_min + " min");
   if (opts.showDueTag) bits.push("due today");
+  // Phase 9: a quiet "from calendar" / "from voice" hint — see
+  // sourceBadge's comment in logic.js for the rules (calendar is
+  // permanent, voice fades after 24h so it never piles up as clutter).
+  const badge = sourceBadge(task, Date.now());
+  if (badge) bits.push(badge);
   if (bits.length) {
     const meta = document.createElement("div");
     meta.className = "task-meta";

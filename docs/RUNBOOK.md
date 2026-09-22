@@ -542,3 +542,109 @@ no box to type a command or question into, so there's nothing `assist`
 would add there. Everything typed or dictated into the capture box itself
 goes through `assist`.
 
+---
+
+## N. Phase 9: calendar two-way sync + voice via Google Tasks
+
+Two things, both running quietly in the background every ~10 minutes, no
+new screen to learn:
+
+- **Calendar two-way sync:** until now, editing a task's due date only ever
+  showed up as a calendar event — never the other way round. From this
+  phase on, dragging an event to a new day in your **Tasks** calendar moves
+  the task's due date to match; deleting an event just removes the task's
+  due date (the task itself is never deleted, same as everywhere else in
+  this app); and adding a brand new event to the Tasks calendar by hand
+  creates a new task for it.
+- **Voice, via Google Tasks:** "Hey Google, add *renew passport* to my
+  tasks" lands here, sorted by the same AI as typing it into the capture
+  box, and "Hey Google, what's on my task list?" reads out today's plan —
+  by using two ordinary Google Tasks lists this app manages, since Google
+  Assistant/Gemini has no idea this app exists otherwise.
+
+See `docs/07-what-we-built-two-way-sync-and-voice.md` for the plain-English
+"why".
+
+1. **Turn on the Tasks Advanced Service** — this is the one extra click
+   Phase 9 needs that earlier phases didn't: the manifest listing it in
+   `appsscript.json` is not always enough on its own the first time.
+   - In the Apps Script editor, left sidebar → **Services** (the **+** next
+     to it).
+   - Find **Google Tasks API** in the list, leave the identifier as
+     `Tasks`, and click **Add**.
+   - If you don't do this and only paste the updated `appsscript.json`,
+     you'll see an error like `Tasks is not defined` the first time
+     `syncGoogleTasks` runs — coming back to this step fixes it.
+2. Replace the contents of `Code.gs` with the latest `apps-script/Code.gs`
+   from this repo, and do the same for `appsscript.json` (section A, step 6
+   shows how to open it) — save both.
+3. Function dropdown → **`runTests`** → **Run**. Should end with "All …
+   tests passed." (all local checks — no Calendar or Google Tasks access
+   yet).
+4. Function dropdown → **`installTriggers`** → **Run**. This now also
+   installs the two new every-~10-minutes triggers, so you'll likely be
+   asked to **re-authorise** the script (same click-through as section A,
+   step 10) — this time for the added Google Tasks permission. Check the
+   Execution log for "…and the calendar sync + Google Tasks voice bridge
+   triggers…".
+5. Function dropdown → **`syncFromCalendar`** → **Run**. Safe to run
+   straight away — with nothing moved or added yet, the log should just say
+   "0 updated, 0 unlinked, 0 created."
+6. Function dropdown → **`syncGoogleTasks`** → **Run**. This is what
+   **creates** the two Google Tasks lists the first time — check the log,
+   then open the **Google Tasks** app (or the Tasks panel in the sidebar of
+   Gmail/Calendar on desktop) and confirm you now see two lists:
+   **"Planner Inbox"** and **"Planner Today"** (the second one already
+   mirroring whatever's in today's plan right now).
+7. Ship it: **Deploy → Manage deployments → pencil icon → Version: New
+   version → Deploy** (section C — same URL, no config change).
+8. Open the app, click **Ping** in Settings → version should now read
+   `0.7.0`. Settings also now has two new lines explaining both halves of
+   this phase in plain English, in case you forget the wording later.
+9. Try the calendar side: open your **Tasks** calendar (Google Calendar
+   app or web), drag any dated task's event to a different day. Wait up to
+   10 minutes (or run `syncFromCalendar` by hand to see it immediately) —
+   the task's due date in the app should follow. Try deleting an event too
+   — the task stays, just without a due date.
+10. Try the voice side, on your phone or a Google Home/Nest device: say
+    **"Hey Google, add buy milk to my Planner Inbox list."** Within about
+    10 minutes (or run `syncGoogleTasks` by hand), it should appear as a
+    real task in the app, sorted into a category by the same AI as typing
+    it — and disappear from the Planner Inbox list itself, since that list
+    is only ever a mailbox on the way in. Then try **"Hey Google, what's on
+    my Planner Today list?"** — it should read out whatever's on today's
+    plan. Tick one off from the Google Tasks app directly and, within 10
+    minutes, it shows as done in the app too.
+
+**Phrases that work with Google Assistant/Gemini for lists** (exact wording
+varies a little by device and by how Google's voice models are doing that
+day — if one doesn't work, try a close variant):
+- "Hey Google, add *[thing]* to my Planner Inbox list."
+- "Hey Google, what's on my Planner Today list?"
+- "Hey Google, add *[thing]* to my Planner Today list" also works, but
+  there's no reason to — anything added there directly (rather than through
+  the app) will just get quietly removed the next time the mirror runs,
+  since it isn't a real task. Always add new things via **Planner Inbox**.
+
+**The ambiguous-name caveat:** if you have other Google Tasks lists with
+similar names (e.g. a personal "Today" list from some other app), Google
+Assistant can sometimes pick the wrong one, or ask you to disambiguate.
+Keeping these two lists named exactly **"Planner Inbox"** and **"Planner
+Today"** — not renaming them — is what keeps that confusion to a minimum;
+if you ever do rename one by hand, update the `GTASKS_INBOX_LIST_TITLE` /
+`GTASKS_TODAY_LIST_TITLE` constants near the top of `Code.gs` to match, or
+the app will just create a fresh list under the old name next time it runs.
+
+**If you see "The script does not have permission … Tasks":** same fix as
+the Calendar version of this in section K — go to
+https://myaccount.google.com/permissions, remove access for this Apps
+Script project, then run `installTriggers` again and authorise fresh (this
+time the prompt should list Google Tasks).
+
+**Changing how often either trigger runs:** both are
+`.timeBased().everyMinutes(10)` in `installTriggers()`. Edit the number (10
+is close to the shortest Apps Script allows), then run `installTriggers`
+again — always safe, it removes old triggers first. `removeTriggers` turns
+every trigger this app manages off, including these two, the nightly tidy
+and the weekly review.
+

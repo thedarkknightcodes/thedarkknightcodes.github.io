@@ -19,6 +19,7 @@ import {
   groupByCategory,
   inboxTasks,
   randomId,
+  sourceBadge,
 } from "../js/logic.js";
 
 let passed = 0;
@@ -279,6 +280,30 @@ test("groupByCategory groups in fixed category order and drops empty ones", () =
   assert.ok(names.indexOf("Career & Learning") < names.indexOf("Inbox"));
   const inboxGroup = groups.find((g) => g[0] === "Inbox");
   assert.equal(inboxGroup[1].length, 2); // id 1 and the unknown-category id 4
+});
+
+// --- sourceBadge (Phase 9) -------------------------------------------------
+
+test("sourceBadge shows 'from calendar' with no time limit", () => {
+  const task = { source: "calendar", created_at: "2020-01-01T00:00:00.000Z" };
+  assert.equal(sourceBadge(task, Date.now()), "from calendar");
+});
+
+test("sourceBadge shows 'from voice' within 24h of created_at", () => {
+  const now = Date.parse("2026-05-01T12:00:00.000Z");
+  const task = { source: "voice", created_at: "2026-05-01T11:00:00.000Z" };
+  assert.equal(sourceBadge(task, now), "from voice");
+});
+
+test("sourceBadge hides 'from voice' after 24h", () => {
+  const now = Date.parse("2026-05-03T12:00:00.000Z");
+  const task = { source: "voice", created_at: "2026-05-01T11:00:00.000Z" };
+  assert.equal(sourceBadge(task, now), "");
+});
+
+test("sourceBadge shows nothing for a typed/ai task", () => {
+  const task = { source: "ai", created_at: new Date().toISOString() };
+  assert.equal(sourceBadge(task, Date.now()), "");
 });
 
 // --- summary -------------------------------------------------------------

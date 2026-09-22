@@ -247,6 +247,22 @@ export function openSettingsSheet(info, handlers) {
   assistTipLine.textContent = "Tip: the box understands commands and questions too — try \"what's due this week?\"";
   dialog.appendChild(assistTipLine);
 
+  // Phase 9: two-way calendar sync + the Google Tasks voice bridge are both
+  // silent background triggers with nothing to click — these two lines are
+  // the only place the app ever mentions them.
+  const voiceLine = document.createElement("p");
+  voiceLine.className = "settings-line";
+  voiceLine.textContent =
+    "Voice: say \"Hey Google, add … to my Planner Inbox list\" or " +
+    "\"what's on my Planner Today list?\"";
+  dialog.appendChild(voiceLine);
+
+  const calendarSyncLine = document.createElement("p");
+  calendarSyncLine.className = "settings-line";
+  calendarSyncLine.textContent =
+    "Calendar: moving or deleting an event in your Tasks calendar updates the task within ~10 minutes.";
+  dialog.appendChild(calendarSyncLine);
+
   const actions = document.createElement("div");
   actions.className = "sheet-actions";
   // Only shown once Android/Chrome has told us the app is installable

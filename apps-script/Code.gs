@@ -62,11 +62,36 @@
  * change it makes is an ordinary task update, so the app's own Undo (and
  * the fact that this app never deletes anything) covers a misread command
  * exactly the same as a mis-tap would.
+ *
+ * Phase 9 makes the Tasks calendar and Google Tasks two more places you can
+ * manage tasks from, not just read them from:
+ *
+ *   - TWO-WAY CALENDAR SYNC: until now, editing a task's due date only ever
+ *     flowed app → Calendar (see syncTaskEvent_ above). A new trigger,
+ *     `syncFromCalendar` (every ~10 minutes, same as everything else in
+ *     this phase), reads the Tasks calendar back and brings Tasks2 into
+ *     line with it: drag an event to a new day and the task's due date
+ *     follows; delete an event and the task just loses its due date (it's
+ *     never deleted, same as everywhere else in this app); create an event
+ *     by hand in that calendar and a new task appears for it. The decision
+ *     logic is the pure planCalendarSync_ below — see its comment for the
+ *     exact rules, including how a ping-pong (app writes the event, event
+ *     write triggers another app write, forever) is avoided.
+ *   - GOOGLE TASKS VOICE BRIDGE: Google Assistant/Gemini can add to and read
+ *     from Google Tasks lists by voice ("Hey Google, add X to my Planner
+ *     Inbox list"), but has no idea this app or its Google Sheet exist. So
+ *     this phase uses the Tasks Advanced Service to create two ordinary
+ *     Google Tasks lists this app owns — "Planner Inbox" (anything said
+ *     into it gets fed through the exact same AI path as typing into the
+ *     capture box, then removed) and "Planner Today" (a live mirror of
+ *     today's plan, so "what's on my task list?" and ticking something off
+ *     both work by voice) — see syncGoogleTasks and its two halves,
+ *     ingestGoogleTasksInbox_ and mirrorTodayToGoogleTasks_, below.
  */
 
 // Bump this whenever you deploy a meaningfully different version. `ping`
 // returns it, so the phone/browser can show you which code it's talking to.
-const CODE_VERSION = "0.6.0";
+const CODE_VERSION = "0.7.0";
 
 // The app's own URL, used in calendar event descriptions ("Open: ...") so
 // a reminder always has a one-tap way back into the app.
@@ -108,8 +133,14 @@ const TASKS2_HEADERS = [
   "id", "title", "notes", "category", "est_min", "status",
   "do_date", "due_date", "due_time", "sort",
   "created_at", "updated_at", "completed_at", "last_touched_at",
-  "calendar_event_id", "source", "raw_input", "op_id",
+  "calendar_event_id", "source", "raw_input", "op_id", "gtask_id",
 ];
+// Phase 9: `gtask_id` remembers which Google Task (in the "Planner Today"
+// list) mirrors this row, so the every-10-minutes mirror
+// (mirrorTodayToGoogleTasks_) can find and update/remove the right one
+// without ever matching on title (titles can repeat or be edited).
+// ensureTab_ backfills this column onto an existing Tasks2 tab automatically
+// the first time this version runs — see that function's comment.
 // Phase 8: `op_id` lets an `assist` retry find its own earlier result
 // instead of asking Gemini (and the sheet) to redo the same work — see
 // findStoredAssistResult_. ensureTab_ adds this column to an EXISTING Log
@@ -894,14 +925,22 @@ function test_assist() {
  * real) and test_assist() (dryRun=true, reads your real tasks for context
  * but never writes a row). See this section's header comment for the
  * numbered flow.
+ *
+ * `taskSourceOverride` (Phase 9) is only ever passed by
+ * ingestGoogleTasksInbox_, so a task that arrived by voice can carry
+ * `source: "voice"` (for the "from voice" badge — see logic.js's
+ * sourceBadge) instead of the usual "ai"/"fallback". Every other caller
+ * omits it and gets today's ordinary behaviour.
  */
-function doAssistInternal_(request, dryRun) {
+function doAssistInternal_(request, dryRun, taskSourceOverride) {
   const payload = request.payload || {};
   const rawInput = String(payload.raw || "").trim();
   const opId = String(payload.op_id || "");
   // Same idea as doCapture's source_hint: purely so the Log tab can tell a
-  // typed ramble apart from a shared one later — changes nothing else.
-  const sourceHint = payload.source_hint === "share" ? "share" : "typed";
+  // typed ramble, a shared one, or a voice one apart later — changes
+  // nothing else.
+  const sourceHint =
+    (payload.source_hint === "share" || payload.source_hint === "voice") ? payload.source_hint : "typed";
   const nowIso = nowIso_();
   const today = todayString_();
 
@@ -963,11 +1002,12 @@ function doAssistInternal_(request, dryRun) {
 
   let response;
   if (assistResult) {
-    response = applyAssistWrites_(tasksSheet, tasksHeaders, assistResult, raw, nowIso, opId);
+    response = applyAssistWrites_(tasksSheet, tasksHeaders, assistResult, raw, nowIso, opId, taskSourceOverride);
   } else {
     // Exactly doCapture's fallback: the whole raw text, saved as one task
     // in the Inbox, so a Gemini outage never loses what was typed/said.
     const fallbackRow = buildFallbackTask_(raw, Utilities.getUuid(), nowIso);
+    if (taskSourceOverride) fallbackRow.source = taskSourceOverride;
     const savedTasks = writeNewTaskRows_(tasksSheet, tasksHeaders, [fallbackRow], opId);
     response = { ok: true, intent: "capture", reply: "", tasks: savedTasks, updated: [], source: "fallback", reason: failureReason || "no_usable_result" };
   }
@@ -1071,14 +1111,14 @@ function callGeminiAssist_(raw, todayStr, contextTasks) {
  * An op whose id has since vanished (dropped, or from a stale context) is
  * quietly skipped, never fails the whole request.
  */
-function applyAssistWrites_(sheet, headers, assistResult, raw, nowIso, opId) {
+function applyAssistWrites_(sheet, headers, assistResult, raw, nowIso, opId, sourceOverride) {
   // Every new task here already came out of parseAssistResult_ clean, so
   // validateNewTask_ should never reject one — but if it somehow does
   // (e.g. a title that ended up empty), drop just that one rather than
   // failing the whole assist.
   const newRows = assistResult.new_tasks.map(function (t) {
     const validated = validateNewTask_(
-      Object.assign({}, t, { id: Utilities.getUuid(), status: "active", source: "ai", raw_input: raw }),
+      Object.assign({}, t, { id: Utilities.getUuid(), status: "active", source: sourceOverride || "ai", raw_input: raw }),
       nowIso
     );
     return validated.ok ? validated.row : null;
@@ -1536,6 +1576,633 @@ function resync_calendar() {
   }
 
   Logger.log("resync_calendar: checked " + values.length + " row(s), " + changed + " calendar_event_id value(s) changed.");
+}
+
+// ---------------------------------------------------------------------------
+// TWO-WAY CALENDAR SYNC (Phase 9)
+// ---------------------------------------------------------------------------
+//
+// Everything above this point only ever writes TO the calendar (app change
+// → event change). This section reads back the other way: something you did
+// by hand in the Tasks calendar app (dragged an event to a new day, deleted
+// one, or added a brand new one) becomes a real change to the task too,
+// within about 10 minutes. See syncFromCalendar (the trigger) and
+// planCalendarSync_ (the pure decision it's built on) below.
+
+/**
+ * PURE: given every task, every event currently in the Tasks calendar
+ * window, the digest event's id, and "now", works out exactly what
+ * syncFromCalendar() should change — no CalendarApp/SpreadsheetApp access
+ * at all, which is what makes this the part runTests() can check directly.
+ *
+ * `events` is a plain array of `{ id, title, allDay, date, time,
+ * lastUpdated, description }` (see calendarEventToPlain_, which is what
+ * turns a real CalendarApp Event into this shape). `tasks` is the usual
+ * array of Tasks2 row objects (rowsToTasks_'s output).
+ *
+ * Three things this figures out, independently:
+ *
+ *   1. UPDATES — an event that's linked to a task (`calendar_event_id`
+ *      matches) whose date/time (or title) no longer matches that task. To
+ *      avoid a ping-pong (task write → event write → this reads the event
+ *      back → task write → ...), a match here only wins when the EVENT was
+ *      touched more recently than the TASK (`lastUpdated` vs `updated_at`)
+ *      — otherwise it's the task's own edit that's waiting to be pushed
+ *      out to the event the normal way (syncTaskEvent_), not something to
+ *      pull back in.
+ *   2. UNLINK — a task whose linked event has vanished from the window
+ *      entirely. syncFromCalendar() double-checks each of these against
+ *      the real calendar (getEventById) before actually clearing anything,
+ *      since a task due more than a year out would otherwise look
+ *      "deleted" just for being outside the ±window this function was
+ *      given — see that function's comment.
+ *   3. CREATE — an event with no linked task at all: something added by
+ *      hand, directly in the Tasks calendar app, rather than through this
+ *      app. Becomes a brand new ACTIVE task (so it shows up on Today/Week
+ *      straight away, same as anything else with a due date) in the Inbox
+ *      category, tagged `source: "calendar"` for the "from calendar" badge
+ *      (see logic.js's sourceBadge).
+ *
+ * The digest event (`digestId`) and anything titled "Today: ..." (belt and
+ * braces — in case a stale/second digest id was ever left lying around) are
+ * excluded from every one of those three, so this can never mistake its own
+ * daily digest for a hand-made task. Same for any event whose description
+ * contains the literal text "planner:ignore" — a deliberate escape hatch
+ * for an event you want in the Tasks calendar (for the reminder) without it
+ * ever becoming, or being treated as, a task.
+ */
+function planCalendarSync_(tasks, events, digestId, nowIso) {
+  const eligible = (events || []).filter(function (ev) {
+    if (!ev || !ev.id) return false;
+    if (digestId && ev.id === digestId) return false;
+    if (String(ev.title || "").indexOf("Today:") === 0) return false;
+    if (String(ev.description || "").indexOf("planner:ignore") !== -1) return false;
+    return true;
+  });
+
+  const eventsById = {};
+  eligible.forEach(function (ev) { eventsById[ev.id] = ev; });
+
+  const tasksByEventId = {};
+  (tasks || []).forEach(function (t) {
+    if (t && t.calendar_event_id) tasksByEventId[t.calendar_event_id] = t;
+  });
+
+  const updates = [];
+  const unlink = [];
+  const create = [];
+
+  // 1) an event linked to a task, moved/renamed more recently than the task
+  // was last edited.
+  eligible.forEach(function (ev) {
+    const task = tasksByEventId[ev.id];
+    if (!task) return; // no task yet — handled by the "create" pass below
+
+    const effectiveDueTime = ev.allDay ? "" : String(ev.time || "");
+    const dateChanged = String(task.due_date || "") !== String(ev.date || "");
+    const timeChanged = String(task.due_time || "") !== effectiveDueTime;
+    if (!dateChanged && !timeChanged) return; // nothing to pull back
+
+    const eventIsNewer = isoToTime_(ev.lastUpdated) > isoToTime_(task.updated_at);
+    if (!eventIsNewer) return; // the TASK's edit is what's waiting to go out, not this
+
+    const fields = { due_date: ev.date, due_time: effectiveDueTime };
+    const eventTitle = String(ev.title || "").trim();
+    if (eventTitle && eventTitle !== String(task.title || "").trim()) {
+      fields.title = eventTitle;
+    }
+    updates.push({ id: task.id, fields: fields });
+  });
+
+  // 2) a task whose linked event just isn't in the window any more.
+  (tasks || []).forEach(function (t) {
+    if (!t || !t.calendar_event_id) return;
+    if (eventsById[t.calendar_event_id]) return; // still there
+    unlink.push(t.id);
+  });
+
+  // 3) an event with no linked task at all — someone made this by hand.
+  eligible.forEach(function (ev) {
+    if (tasksByEventId[ev.id]) return;
+    const title = String(ev.title || "").trim() || "(untitled calendar event)";
+    create.push({
+      title: title,
+      due_date: ev.date,
+      due_time: ev.allDay ? "" : String(ev.time || ""),
+      event_id: ev.id,
+    });
+  });
+
+  return { updates: updates, unlink: unlink, create: create };
+}
+
+/** Milliseconds since epoch for an ISO timestamp, or 0 for anything that
+ * doesn't parse — used only to compare "which happened more recently",
+ * where 0 (i.e. "treat it as ancient") is always the safe default. */
+function isoToTime_(iso) {
+  const t = new Date(iso).getTime();
+  return isNaN(t) ? 0 : t;
+}
+
+/**
+ * Turns one real CalendarApp Event into the plain object planCalendarSync_
+ * expects — no logic here beyond that translation, kept deliberately dumb
+ * so the one function with any actual DECIDING to do can be pure and
+ * tested. Returns null (never throws) if a single event can't be read for
+ * some reason, so one odd event can never take down the whole sync.
+ */
+function calendarEventToPlain_(ev) {
+  try {
+    const allDay = ev.isAllDayEvent();
+    const tz = Session.getScriptTimeZone();
+    let date, time;
+    if (allDay) {
+      date = Utilities.formatDate(ev.getAllDayStartDate(), tz, "yyyy-MM-dd");
+      time = "";
+    } else {
+      const start = ev.getStartTime();
+      date = Utilities.formatDate(start, tz, "yyyy-MM-dd");
+      time = Utilities.formatDate(start, tz, "HH:mm");
+    }
+    return {
+      id: ev.getId(),
+      title: ev.getTitle(),
+      allDay: allDay,
+      date: date,
+      time: time,
+      lastUpdated: ev.getLastUpdated().toISOString(),
+      description: ev.getDescription() || "",
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
+ * Runs automatically every ~10 minutes (see installTriggers) and can also
+ * be run by hand any time (function dropdown → `syncFromCalendar` → Run) to
+ * see it work without waiting. Reads the Tasks calendar from a month ago to
+ * a year ahead, works out what changed with the pure planCalendarSync_
+ * above, then applies it.
+ *
+ * Calendar READS happen before the lock (a getEvents() call over a wide
+ * window can take a moment, and there's no reason to make every other
+ * request queue up behind it — same reasoning as doCapture's Gemini call).
+ * All the sheet WRITES happen under one lock. Never throws: a calendar
+ * hiccup, or a single bad row, must never stop the trigger from quietly
+ * trying again in 10 minutes.
+ */
+function syncFromCalendar() {
+  try {
+    const ss = getSpreadsheet_();
+    const sheet = ensureTabs_(ss);
+    const headers = getHeaders_(sheet);
+    const nowIso = nowIso_();
+    const digestId = PropertiesService.getScriptProperties().getProperty("DIGEST_EVENT_ID") || "";
+
+    const lastRow = sheet.getLastRow();
+    const tasks = lastRow < 2
+      ? []
+      : rowsToTasks_(headers, sheet.getRange(2, 1, lastRow - 1, headers.length).getValues());
+
+    const start = new Date();
+    start.setDate(start.getDate() - 30);
+    const end = new Date();
+    end.setDate(end.getDate() + 365);
+
+    const cal = getTasksCalendar_();
+    const events = cal.getEvents(start, end).map(calendarEventToPlain_).filter(function (e) { return e !== null; });
+
+    const plan = planCalendarSync_(tasks, events, digestId, nowIso);
+
+    // Confirm every "unlink" candidate against the real calendar (not just
+    // this window) before clearing anything — see planCalendarSync_'s
+    // comment on why "not in the window" alone isn't proof of deletion.
+    const tasksById = {};
+    tasks.forEach(function (t) { tasksById[t.id] = t; });
+    const confirmedUnlink = [];
+    for (let i = 0; i < plan.unlink.length; i++) {
+      const t = tasksById[plan.unlink[i]];
+      if (!t || !t.calendar_event_id) continue;
+      try {
+        const stillThere = cal.getEventById(t.calendar_event_id);
+        if (!stillThere) confirmedUnlink.push(t.id);
+      } catch (err) {
+        Logger.log("syncFromCalendar: couldn't confirm deletion for " + t.id + ": " + errorMessage_(err));
+      }
+    }
+
+    let updatedCount = 0, unlinkedCount = 0, createdCount = 0;
+
+    const lock = LockService.getScriptLock();
+    lock.waitLock(10000);
+    try {
+      const liveHeaders = getHeaders_(sheet);
+      const idIndex = buildIdIndex_(sheet, liveHeaders);
+
+      for (let i = 0; i < plan.updates.length; i++) {
+        try {
+          const u = plan.updates[i];
+          const rowNum = idIndex[u.id];
+          if (!rowNum) continue;
+          const rowValues = sheet.getRange(rowNum, 1, 1, liveHeaders.length).getValues()[0];
+          const existingTask = rowToTask_(liveHeaders, rowValues);
+          const result = applyUpdate_(existingTask, u.fields, nowIso);
+          if (!result.ok) continue;
+          // No syncTaskEvent_ call here — the event is already exactly
+          // what the task should now match (that's WHY this is updating
+          // it), so writing back to Calendar would just be a pointless
+          // round trip, and the thing this whole design avoids.
+          sheet.getRange(rowNum, 1, 1, liveHeaders.length).setValues([taskToRowValues_(liveHeaders, result.task)]);
+          updatedCount++;
+        } catch (err) {
+          Logger.log("syncFromCalendar: update failed: " + errorMessage_(err));
+        }
+      }
+
+      for (let i = 0; i < confirmedUnlink.length; i++) {
+        try {
+          const id = confirmedUnlink[i];
+          const rowNum = idIndex[id];
+          if (!rowNum) continue;
+          const rowValues = sheet.getRange(rowNum, 1, 1, liveHeaders.length).getValues()[0];
+          const existingTask = rowToTask_(liveHeaders, rowValues);
+          const result = applyUpdate_(existingTask, { due_date: "", due_time: "" }, nowIso);
+          if (!result.ok) continue;
+          result.task.calendar_event_id = ""; // not an UPDATABLE_FIELDS key — set directly
+          sheet.getRange(rowNum, 1, 1, liveHeaders.length).setValues([taskToRowValues_(liveHeaders, result.task)]);
+          unlinkedCount++;
+        } catch (err) {
+          Logger.log("syncFromCalendar: unlink failed: " + errorMessage_(err));
+        }
+      }
+
+      if (plan.create.length) {
+        const rows = plan.create.map(function (c) {
+          const validated = validateNewTask_({
+            id: Utilities.getUuid(), title: c.title, category: "Inbox", status: "active",
+            due_date: c.due_date, due_time: c.due_time, source: "calendar",
+          }, nowIso);
+          if (!validated.ok) return null;
+          validated.row.calendar_event_id = c.event_id; // it already has a real event — just link it
+          return validated.row;
+        }).filter(function (r) { return r !== null; });
+
+        if (rows.length) {
+          const startRow = sheet.getLastRow() + 1;
+          const values = rows.map(function (row) { row.op_id = ""; return taskToRowValues_(liveHeaders, row); });
+          sheet.getRange(startRow, 1, values.length, liveHeaders.length).setValues(values);
+          for (let i = 0; i < values.length; i++) {
+            try {
+              const task = rowToTask_(liveHeaders, values[i]);
+              // The event already exists — this just brings it up to the
+              // same standard as any other dated task (the app's own
+              // reminders, the "Open: <app>" line in its description).
+              syncTaskEvent_(sheet, liveHeaders, startRow + i, task);
+              createdCount++;
+            } catch (err) {
+              Logger.log("syncFromCalendar: create-sync failed: " + errorMessage_(err));
+            }
+            if (i < values.length - 1) Utilities.sleep(200);
+          }
+        }
+      }
+    } finally {
+      lock.releaseLock();
+    }
+
+    Logger.log(
+      "syncFromCalendar: " + updatedCount + " task(s) updated from a moved/renamed event, " +
+      unlinkedCount + " unlinked (event deleted), " + createdCount + " created from a hand-made event."
+    );
+  } catch (err) {
+    Logger.log("syncFromCalendar: FAILED — " + errorMessage_(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GOOGLE TASKS VOICE BRIDGE (Phase 9)
+// ---------------------------------------------------------------------------
+//
+// Two Google Tasks lists, made (once) by this app and remembered by id in
+// Script Properties so we always find the SAME two lists again:
+//
+//   - "Planner Inbox" — say "Hey Google, add X to my Planner Inbox list"
+//     and X lands here. ingestGoogleTasksInbox_ runs it through the exact
+//     same AI path as typing into the capture box, then deletes it from
+//     Google Tasks — it only ever passes through this list on its way in.
+//   - "Planner Today" — a live mirror of today's plan, kept in sync by
+//     mirrorTodayToGoogleTasks_, so "Hey Google, what's on my Planner Today
+//     list?" reads it out, and ticking one off there completes it here too.
+//
+// Both need the Tasks Advanced Service turned on (see docs/RUNBOOK.md
+// section N) — that's what makes the global `Tasks` object below available.
+
+const GTASKS_INBOX_LIST_TITLE = "Planner Inbox";
+const GTASKS_TODAY_LIST_TITLE = "Planner Today";
+
+/**
+ * Finds the Google Tasks list this app uses for one of the two jobs above,
+ * creating it if it doesn't exist yet, and always remembering its id in the
+ * given Script Property so future calls find the SAME list. If a
+ * previously-saved id no longer resolves (list deleted by hand), this first
+ * checks whether a list with the right TITLE already exists before making a
+ * new one — avoids ending up with two "Planner Inbox" lists just because a
+ * save of the id once failed.
+ */
+function getOrCreateTaskList_(propKey, title) {
+  const props = PropertiesService.getScriptProperties();
+  const existingId = props.getProperty(propKey);
+
+  if (existingId) {
+    try {
+      const found = Tasks.Tasklists.get(existingId);
+      if (found && found.id) return found.id;
+    } catch (err) {
+      // Saved id doesn't resolve any more (e.g. deleted by hand) — fall
+      // through and look for/make one fresh rather than throwing.
+    }
+  }
+
+  const list = Tasks.Tasklists.list({ maxResults: 100 });
+  const items = (list && list.items) || [];
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].title === title) {
+      props.setProperty(propKey, items[i].id);
+      return items[i].id;
+    }
+  }
+
+  const created = Tasks.Tasklists.insert({ title: title });
+  props.setProperty(propKey, created.id);
+  return created.id;
+}
+
+/**
+ * Runs automatically every ~10 minutes (see installTriggers) and can also
+ * be run by hand (function dropdown → `syncGoogleTasks` → Run) — the first
+ * run is also what CREATES the two lists, so run it once by hand right
+ * after turning this phase on (docs/RUNBOOK.md section N). Never throws:
+ * a Google Tasks hiccup must never stop the trigger from trying again in
+ * 10 minutes.
+ */
+function syncGoogleTasks() {
+  try {
+    const inboxListId = getOrCreateTaskList_("GTASKS_INBOX_LIST_ID", GTASKS_INBOX_LIST_TITLE);
+    const todayListId = getOrCreateTaskList_("GTASKS_TODAY_LIST_ID", GTASKS_TODAY_LIST_TITLE);
+
+    const ingested = ingestGoogleTasksInbox_(inboxListId);
+    const mirror = mirrorTodayToGoogleTasks_(todayListId);
+
+    Logger.log(
+      "syncGoogleTasks: " + ingested + " voice item(s) ingested from Planner Inbox; " +
+      "Planner Today mirror — " + mirror.inserted + " added, " + mirror.removed + " removed, " +
+      mirror.completed + " completed via Google Tasks."
+    );
+  } catch (err) {
+    Logger.log("syncGoogleTasks: FAILED — " + errorMessage_(err));
+  }
+}
+
+/**
+ * Reads every not-yet-completed item out of the "Planner Inbox" Google
+ * Tasks list, feeds each one's title through doAssistInternal_ (source_hint
+ * "voice", so the resulting task(s) carry `source: "voice"` for the "from
+ * voice" badge — see logic.js's sourceBadge), then deletes it from Google
+ * Tasks — it's a mailbox, not a list of its own.
+ *
+ * Idempotency piggybacks on doAssistInternal_'s EXISTING op_id mechanism
+ * (findStoredAssistResult_) rather than a separate check: op_id is set to
+ * "gtask:" + the Google Task's own id, so if the delete below ever fails
+ * (network hiccup, quota) and this item is still here next run, the second
+ * call just returns the stored result instead of asking Gemini (and the
+ * sheet) to redo the same work — and then tries the delete again. Nothing
+ * is ever double-captured, and nothing is ever lost if a delete fails
+ * (the item is simply picked up again in ~10 minutes).
+ */
+function ingestGoogleTasksInbox_(listId) {
+  let items;
+  try {
+    const resp = Tasks.Tasks.list(listId, { showCompleted: false, showHidden: false, maxResults: 100 });
+    items = (resp && resp.items) || [];
+  } catch (err) {
+    Logger.log("ingestGoogleTasksInbox_: couldn't list Planner Inbox: " + errorMessage_(err));
+    return 0;
+  }
+
+  let count = 0;
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    try {
+      const raw = String(item.title || "").trim();
+      if (raw) {
+        doAssistInternal_(
+          { payload: { raw: raw, op_id: "gtask:" + item.id, source_hint: "voice" } },
+          false,
+          "voice"
+        );
+      }
+      Tasks.Tasks.remove(listId, item.id);
+      count++;
+    } catch (err) {
+      // Leave it in the list — never lose a voice item; it's tried again
+      // next time this runs.
+      Logger.log("ingestGoogleTasksInbox_: failed on \"" + item.title + "\" (" + item.id + "): " + errorMessage_(err));
+    }
+    Utilities.sleep(150);
+  }
+  return count;
+}
+
+/**
+ * PURE: today's plan, in the same shape and order the app itself would show
+ * on the Today screen — active tasks due or planned for today, dated ones
+ * first (a due/do date is more "pinned in place" than an undated one),
+ * created-earliest-first as a stable tie-break. No sheet/network access, so
+ * this is safe to unit-test and to reuse from mirrorTodayToGoogleTasks_
+ * without a real spreadsheet.
+ */
+function selectTodayPlanTasks_(tasks, todayStr) {
+  return (tasks || [])
+    .filter(function (t) {
+      return t && t.status === "active" && (t.do_date === todayStr || t.due_date === todayStr);
+    })
+    .sort(function (a, b) {
+      const ad = a.do_date || a.due_date || "";
+      const bd = b.do_date || b.due_date || "";
+      if (ad !== bd) return ad < bd ? -1 : 1;
+      return String(a.created_at || "").localeCompare(String(b.created_at || ""));
+    });
+}
+
+/**
+ * PURE: given today's plan (planTasks, each carrying its OWN current
+ * `gtask_id` — the mapping lives on the task, not passed separately) and
+ * whatever's currently in the "Planner Today" Google Tasks list, works out
+ * exactly what mirrorTodayToGoogleTasks_ should do:
+ *
+ *   - `insert`: planner ids with no live Google Task yet (never had one, or
+ *     their old one is gone) — a new Google Task needs creating for these.
+ *   - `remove`: Google Task ids to delete outright — either they're ticked
+ *     (Google Tasks id `status === "completed"`, in which case the matching
+ *     planner task also goes in `complete`, below) or they don't match ANY
+ *     task in today's plan any more (the planner task got done/dropped/
+ *     rescheduled away from today through the app instead).
+ *   - `complete`: planner ids whose Google Task was ticked — these get
+ *     marked done back in Tasks2 (and their Google Task removed, since a
+ *     completed task no longer belongs on today's list).
+ *
+ * Matching is ALWAYS by id (`gtask_id` ↔ Google Task id), never by title —
+ * titles can repeat, or get edited on either side, and an id match is the
+ * only thing that can't be fooled by that.
+ */
+function planTodayMirror_(planTasks, gTasks) {
+  const plan = planTasks || [];
+  const g = gTasks || [];
+
+  const gById = {};
+  g.forEach(function (item) { if (item && item.id) gById[item.id] = item; });
+
+  const insert = [];
+  const remove = [];
+  const complete = [];
+  const matchedGtaskIds = {};
+
+  plan.forEach(function (t) {
+    const linked = t.gtask_id && gById[t.gtask_id];
+    if (!linked) {
+      insert.push(t.id);
+      return;
+    }
+    matchedGtaskIds[t.gtask_id] = true;
+    if (linked.status === "completed") {
+      complete.push(t.id);
+      remove.push(t.gtask_id);
+    }
+  });
+
+  // Any Google Task NOT linked to a task still in today's plan — either it
+  // fell off today's plan through the app (done/dropped/moved elsewhere) or
+  // it's some other leftover — gets removed, so the list only ever shows
+  // exactly today's active plan, nothing more.
+  g.forEach(function (item) {
+    if (!item || !item.id) return;
+    if (matchedGtaskIds[item.id]) return; // already accounted for above
+    if (remove.indexOf(item.id) === -1) remove.push(item.id);
+  });
+
+  return { insert: insert, remove: remove, complete: complete };
+}
+
+/**
+ * The impure other half of planTodayMirror_: reads Tasks2 and the "Planner
+ * Today" Google Tasks list, applies the plan, and returns a small summary
+ * for syncGoogleTasks' log line. Completions are written back FIRST (same
+ * "sheet write settles before anything else" order every other action in
+ * this file follows), then removals, then insertions (which is also where
+ * the new `gtask_id` gets written back onto each row).
+ */
+function mirrorTodayToGoogleTasks_(todayListId) {
+  const ss = getSpreadsheet_();
+  const sheet = ensureTabs_(ss);
+  const headers = getHeaders_(sheet);
+  const lastRow = sheet.getLastRow();
+  const allTasks = lastRow < 2
+    ? []
+    : rowsToTasks_(headers, sheet.getRange(2, 1, lastRow - 1, headers.length).getValues());
+
+  const today = todayString_();
+  const planTasks = selectTodayPlanTasks_(allTasks, today);
+
+  let gItems;
+  try {
+    const resp = Tasks.Tasks.list(todayListId, { showCompleted: true, showHidden: true, maxResults: 100 });
+    gItems = (resp && resp.items) || [];
+  } catch (err) {
+    Logger.log("mirrorTodayToGoogleTasks_: couldn't list Planner Today: " + errorMessage_(err));
+    return { inserted: 0, removed: 0, completed: 0 };
+  }
+
+  const plan = planTodayMirror_(planTasks, gItems);
+  let inserted = 0, removed = 0, completed = 0;
+
+  if (plan.complete.length) {
+    const lock = LockService.getScriptLock();
+    lock.waitLock(10000);
+    try {
+      const liveHeaders = getHeaders_(sheet);
+      const idIndex = buildIdIndex_(sheet, liveHeaders);
+      const nowIso = nowIso_();
+      for (let i = 0; i < plan.complete.length; i++) {
+        try {
+          const rowNum = idIndex[plan.complete[i]];
+          if (!rowNum) continue;
+          const rowValues = sheet.getRange(rowNum, 1, 1, liveHeaders.length).getValues()[0];
+          const existingTask = rowToTask_(liveHeaders, rowValues);
+          const result = applyUpdate_(existingTask, { status: "done" }, nowIso);
+          if (!result.ok) continue;
+          sheet.getRange(rowNum, 1, 1, liveHeaders.length).setValues([taskToRowValues_(liveHeaders, result.task)]);
+          // A completed task no longer wants a due-date reminder ticking
+          // away — same calendar cleanup an ordinary tap-to-complete gets.
+          result.task.calendar_event_id = syncTaskEvent_(sheet, liveHeaders, rowNum, result.task);
+          completed++;
+        } catch (err) {
+          Logger.log("mirrorTodayToGoogleTasks_: complete failed: " + errorMessage_(err));
+        }
+      }
+    } finally {
+      lock.releaseLock();
+    }
+  }
+
+  for (let i = 0; i < plan.remove.length; i++) {
+    try {
+      Tasks.Tasks.remove(todayListId, plan.remove[i]);
+      removed++;
+    } catch (err) {
+      Logger.log("mirrorTodayToGoogleTasks_: remove failed for " + plan.remove[i] + ": " + errorMessage_(err));
+    }
+    Utilities.sleep(150);
+  }
+
+  if (plan.insert.length) {
+    const lock = LockService.getScriptLock();
+    lock.waitLock(10000);
+    try {
+      const liveHeaders = getHeaders_(sheet);
+      const idIndex = buildIdIndex_(sheet, liveHeaders);
+      const gtaskCol = liveHeaders.indexOf("gtask_id");
+      for (let i = 0; i < plan.insert.length; i++) {
+        const id = plan.insert[i];
+        try {
+          const rowNum = idIndex[id];
+          if (!rowNum) continue;
+          const rowValues = sheet.getRange(rowNum, 1, 1, liveHeaders.length).getValues()[0];
+          const task = rowToTask_(liveHeaders, rowValues);
+
+          const notesBits = [];
+          if (task.category && task.category !== "Inbox") notesBits.push(task.category);
+          if (task.est_min) notesBits.push(task.est_min + " min");
+
+          const created = Tasks.Tasks.insert({
+            title: task.title,
+            notes: notesBits.join(" · "),
+            due: today + "T00:00:00.000Z", // Tasks API wants a full RFC3339 timestamp even for a date-only due
+          }, todayListId);
+
+          if (gtaskCol !== -1) sheet.getRange(rowNum, gtaskCol + 1).setValue(created.id);
+          inserted++;
+        } catch (err) {
+          Logger.log("mirrorTodayToGoogleTasks_: insert failed for " + id + ": " + errorMessage_(err));
+        }
+        Utilities.sleep(150);
+      }
+    } finally {
+      lock.releaseLock();
+    }
+  }
+
+  return { inserted: inserted, removed: removed, completed: completed };
 }
 
 // ---------------------------------------------------------------------------
@@ -2272,26 +2939,33 @@ function installTriggers() {
   removeTriggers();
   ScriptApp.newTrigger("nightlyTidy").timeBased().everyDays(1).atHour(3).create();
   ScriptApp.newTrigger("weeklyGeminiReview").timeBased().onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(8).create();
+  // Phase 9: two-way calendar sync and the Google Tasks voice bridge both
+  // run every ~10 minutes — frequent enough that a moved event or a voice
+  // capture never feels stuck, without hammering either API.
+  ScriptApp.newTrigger("syncFromCalendar").timeBased().everyMinutes(10).create();
+  ScriptApp.newTrigger("syncGoogleTasks").timeBased().everyMinutes(10).create();
   Logger.log(
-    "Installed the nightly tidy trigger (roughly 3:00–3:15am daily) and the " +
-    "weekly review trigger (roughly 8:00–8:15am Mondays)."
+    "Installed the nightly tidy trigger (roughly 3:00–3:15am daily), the weekly " +
+    "review trigger (roughly 8:00–8:15am Mondays), and the calendar sync + Google " +
+    "Tasks voice bridge triggers (both roughly every 10 minutes)."
   );
 }
 
-/** Turns the nightly tidy and the weekly review trigger back off. Run by
- * hand (function dropdown → `removeTriggers` → Run) if you ever want to
- * pause either. */
+/** Turns every trigger this app manages back off. Run by hand (function
+ * dropdown → `removeTriggers` → Run) if you ever want to pause any of
+ * them — installTriggers always calls this first too, so re-running
+ * installTriggers is always safe and never creates a duplicate. */
 function removeTriggers() {
   const triggers = ScriptApp.getProjectTriggers();
   let removed = 0;
   for (let i = 0; i < triggers.length; i++) {
     const fn = triggers[i].getHandlerFunction();
-    if (fn === "nightlyTidy" || fn === "weeklyGeminiReview") {
+    if (fn === "nightlyTidy" || fn === "weeklyGeminiReview" || fn === "syncFromCalendar" || fn === "syncGoogleTasks") {
       ScriptApp.deleteTrigger(triggers[i]);
       removed++;
     }
   }
-  Logger.log("Removed " + removed + " existing trigger(s) (nightlyTidy/weeklyGeminiReview).");
+  Logger.log("Removed " + removed + " existing trigger(s) (nightlyTidy/weeklyGeminiReview/syncFromCalendar/syncGoogleTasks).");
 }
 
 // ---------------------------------------------------------------------------
@@ -3263,6 +3937,20 @@ function runTests() {
   test_selectAssistContextTasks_prioritisesActiveAndDated_(results);
   test_selectAssistContextTasks_returnsAllWhenUnderCap_(results);
 
+  test_planCalendarSync_movedEventUpdatesTask_(results);
+  test_planCalendarSync_olderEventDoesNotOverrideNewerTask_(results);
+  test_planCalendarSync_deletedEventUnlinks_(results);
+  test_planCalendarSync_handMadeEventCreates_(results);
+  test_planCalendarSync_digestIgnored_(results);
+  test_planCalendarSync_plannerIgnoreMarkerIgnored_(results);
+  test_planCalendarSync_titleChangeCarriedWithDateChange_(results);
+
+  test_selectTodayPlanTasks_filtersAndSortsByDate_(results);
+  test_planTodayMirror_insertsUnlinkedPlanTasks_(results);
+  test_planTodayMirror_completedGtaskCompletesAndRemoves_(results);
+  test_planTodayMirror_removesGtaskNoLongerInPlan_(results);
+  test_planTodayMirror_matchesByIdNotTitle_(results);
+
   const failed = results.filter(function (r) { return !r.pass; });
   Logger.log(results.map(function (r) {
     return (r.pass ? "PASS: " : "FAIL: ") + r.name;
@@ -3987,4 +4675,149 @@ function test_selectAssistContextTasks_returnsAllWhenUnderCap_(results) {
   const picked = selectAssistContextTasks_(tasks, 10);
   assert_(results, "selectAssistContextTasks_ returns every task unchanged when there's room for all of them",
     picked.length === 2);
+}
+
+// --- Phase 9: planCalendarSync_ ---------------------------------------------
+
+function test_planCalendarSync_movedEventUpdatesTask_(results) {
+  const tasks = [{
+    id: "t1", title: "Dentist", calendar_event_id: "e1",
+    due_date: "2026-09-20", due_time: "", updated_at: "2026-09-19T09:00:00.000Z",
+  }];
+  const events = [{
+    id: "e1", title: "Dentist", allDay: true, date: "2026-09-25", time: "",
+    lastUpdated: "2026-09-20T10:00:00.000Z", description: "",
+  }];
+  const plan = planCalendarSync_(tasks, events, "digest1", "2026-09-20T12:00:00.000Z");
+  assert_(results, "planCalendarSync_ updates a task whose linked event moved to a new date",
+    plan.updates.length === 1 && plan.updates[0].id === "t1" && plan.updates[0].fields.due_date === "2026-09-25");
+  assert_(results, "planCalendarSync_ creates nothing and unlinks nothing for a moved-but-still-linked event",
+    plan.create.length === 0 && plan.unlink.length === 0);
+}
+
+function test_planCalendarSync_olderEventDoesNotOverrideNewerTask_(results) {
+  const tasks = [{
+    id: "t1", title: "Dentist", calendar_event_id: "e1",
+    due_date: "2026-09-20", due_time: "", updated_at: "2026-09-22T09:00:00.000Z", // edited in the app AFTER the event
+  }];
+  const events = [{
+    id: "e1", title: "Dentist", allDay: true, date: "2026-09-25", time: "",
+    lastUpdated: "2026-09-20T10:00:00.000Z", // older than the task's own edit
+    description: "",
+  }];
+  const plan = planCalendarSync_(tasks, events, "digest1", "2026-09-23T00:00:00.000Z");
+  assert_(results, "planCalendarSync_ leaves a task alone when its OWN edit is newer than the event",
+    plan.updates.length === 0);
+}
+
+function test_planCalendarSync_deletedEventUnlinks_(results) {
+  const tasks = [{
+    id: "t1", title: "Dentist", calendar_event_id: "e1",
+    due_date: "2026-09-20", due_time: "09:00", updated_at: "2026-09-19T09:00:00.000Z",
+  }];
+  const plan = planCalendarSync_(tasks, [], "digest1", "2026-09-20T12:00:00.000Z");
+  assert_(results, "planCalendarSync_ unlinks a task whose event is gone from the window entirely",
+    plan.unlink.length === 1 && plan.unlink[0] === "t1");
+}
+
+function test_planCalendarSync_handMadeEventCreates_(results) {
+  const events = [{
+    id: "e2", title: "Pay the window cleaner", allDay: true, date: "2026-09-26", time: "",
+    lastUpdated: "2026-09-20T10:00:00.000Z", description: "",
+  }];
+  const plan = planCalendarSync_([], events, "digest1", "2026-09-20T12:00:00.000Z");
+  assert_(results, "planCalendarSync_ proposes a new task for an event with no matching task",
+    plan.create.length === 1 &&
+    plan.create[0].event_id === "e2" &&
+    plan.create[0].title === "Pay the window cleaner" &&
+    plan.create[0].due_date === "2026-09-26");
+}
+
+function test_planCalendarSync_digestIgnored_(results) {
+  const events = [{
+    id: "digest1", title: "Today: 3 things — start with X", allDay: false, date: "2026-09-20", time: "07:30",
+    lastUpdated: "2026-09-20T03:00:00.000Z", description: "",
+  }];
+  const plan = planCalendarSync_([], events, "digest1", "2026-09-20T12:00:00.000Z");
+  assert_(results, "planCalendarSync_ never turns the digest event into a task",
+    plan.create.length === 0);
+}
+
+function test_planCalendarSync_plannerIgnoreMarkerIgnored_(results) {
+  const events = [{
+    id: "e3", title: "Bin collection", allDay: true, date: "2026-09-26", time: "",
+    lastUpdated: "2026-09-20T10:00:00.000Z", description: "just a reminder — planner:ignore",
+  }];
+  const plan = planCalendarSync_([], events, "digest1", "2026-09-20T12:00:00.000Z");
+  assert_(results, "planCalendarSync_ skips an event marked planner:ignore",
+    plan.create.length === 0);
+}
+
+function test_planCalendarSync_titleChangeCarriedWithDateChange_(results) {
+  const tasks = [{
+    id: "t1", title: "Old title", calendar_event_id: "e1",
+    due_date: "2026-09-20", due_time: "", updated_at: "2026-09-19T09:00:00.000Z",
+  }];
+  const events = [{
+    id: "e1", title: "New title", allDay: true, date: "2026-09-25", time: "",
+    lastUpdated: "2026-09-20T10:00:00.000Z", description: "",
+  }];
+  const plan = planCalendarSync_(tasks, events, "digest1", "2026-09-20T12:00:00.000Z");
+  assert_(results, "planCalendarSync_ carries a title change along when the date change already triggered an update",
+    plan.updates.length === 1 && plan.updates[0].fields.title === "New title");
+}
+
+// --- Phase 9: selectTodayPlanTasks_ / planTodayMirror_ ----------------------
+
+function test_selectTodayPlanTasks_filtersAndSortsByDate_(results) {
+  const tasks = [
+    { id: "1", status: "active", do_date: "2026-09-20", created_at: "2026-09-01T00:00:00.000Z" },
+    { id: "2", status: "active", due_date: "2026-09-20", created_at: "2026-09-02T00:00:00.000Z" },
+    { id: "3", status: "someday", do_date: "2026-09-20", created_at: "2026-09-03T00:00:00.000Z" },
+    { id: "4", status: "active", do_date: "2026-09-21", created_at: "2026-09-04T00:00:00.000Z" },
+  ];
+  const today = selectTodayPlanTasks_(tasks, "2026-09-20");
+  assert_(results, "selectTodayPlanTasks_ only keeps active tasks due or planned for today",
+    today.length === 2 && today.map(function (t) { return t.id; }).sort().join(",") === "1,2");
+}
+
+function test_planTodayMirror_insertsUnlinkedPlanTasks_(results) {
+  const planTasks = [{ id: "t1", gtask_id: "" }];
+  const plan = planTodayMirror_(planTasks, []);
+  assert_(results, "planTodayMirror_ proposes inserting a plan task with no Google Task yet",
+    plan.insert.length === 1 && plan.insert[0] === "t1" && plan.remove.length === 0 && plan.complete.length === 0);
+}
+
+function test_planTodayMirror_completedGtaskCompletesAndRemoves_(results) {
+  const planTasks = [{ id: "t1", gtask_id: "g1" }];
+  const gTasks = [{ id: "g1", status: "completed" }];
+  const plan = planTodayMirror_(planTasks, gTasks);
+  assert_(results, "planTodayMirror_ completes the planner task and removes the ticked Google Task",
+    plan.complete.length === 1 && plan.complete[0] === "t1" &&
+    plan.remove.length === 1 && plan.remove[0] === "g1" &&
+    plan.insert.length === 0);
+}
+
+function test_planTodayMirror_removesGtaskNoLongerInPlan_(results) {
+  const planTasks = [{ id: "t1", gtask_id: "g1" }]; // t1 still on today's plan
+  const gTasks = [
+    { id: "g1", status: "needsAction" },
+    { id: "g2", status: "needsAction" }, // belongs to a task that's no longer in today's plan
+  ];
+  const plan = planTodayMirror_(planTasks, gTasks);
+  assert_(results, "planTodayMirror_ removes a Google Task that no longer matches any task in today's plan",
+    plan.remove.length === 1 && plan.remove[0] === "g2" && plan.insert.length === 0 && plan.complete.length === 0);
+}
+
+function test_planTodayMirror_matchesByIdNotTitle_(results) {
+  // Same title on both sides, but linked to a DIFFERENT Google Task id —
+  // a title match must never substitute for the real id match.
+  const planTasks = [{ id: "t1", title: "Buy milk", gtask_id: "g-real" }];
+  const gTasks = [
+    { id: "g-real", title: "Buy milk", status: "needsAction" },
+    { id: "g-other", title: "Buy milk", status: "needsAction" }, // decoy, unrelated id
+  ];
+  const plan = planTodayMirror_(planTasks, gTasks);
+  assert_(results, "planTodayMirror_ matches strictly by id — a same-titled decoy Google Task is removed, not adopted",
+    plan.remove.length === 1 && plan.remove[0] === "g-other" && plan.insert.length === 0 && plan.complete.length === 0);
 }

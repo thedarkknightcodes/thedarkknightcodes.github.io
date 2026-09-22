@@ -308,3 +308,30 @@ export function groupByCategory(tasks) {
   }
   return Array.from(map.entries()).filter(function (entry) { return entry[1].length > 0; });
 }
+
+// --- Phase 9: where a task came from -----------------------------------
+
+// "from voice" only matters right after a task lands — a task you added by
+// saying "Hey Google, add X to my tasks" a month ago doesn't need a
+// permanent label reminding you how it got here. 24 hours is long enough to
+// notice it and short enough to disappear before it's just clutter.
+const VOICE_BADGE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * A tiny "from calendar" / "from voice" label for a task row's meta line —
+ * `null`/`""` when nothing should show. "from calendar" (a task created by
+ * hand-adding an event to the Tasks calendar) has no time window: knowing
+ * where it came from stays useful indefinitely, since that's also where
+ * you'd go to move or delete it. "from voice" fades out after
+ * VOICE_BADGE_WINDOW_MS so it never becomes permanent noise.
+ */
+export function sourceBadge(task, nowMs) {
+  if (!task) return "";
+  if (task.source === "calendar") return "from calendar";
+  if (task.source === "voice") {
+    const created = Date.parse(task.created_at || "");
+    const now = typeof nowMs === "number" ? nowMs : Date.now();
+    if (!isNaN(created) && now - created < VOICE_BADGE_WINDOW_MS) return "from voice";
+  }
+  return "";
+}

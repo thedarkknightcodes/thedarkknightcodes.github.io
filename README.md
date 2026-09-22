@@ -11,7 +11,22 @@ security and reliability problems (see `docs/00-what-we-built-security.md`
 for the first one fixed). It's being replaced a phase at a time, with each
 phase actually used for a while before the next one starts.
 
-## Current status: Phase 8 — secretary mode
+## Current status: Phase 9 — two-way calendar sync + voice via Google Tasks
+
+Phase 9 makes the Tasks calendar and Google Tasks two more places you can
+manage tasks from, not just read them from. Reminders used to only flow
+app → Calendar; now dragging an event to a new day moves the task's due
+date to match, deleting an event clears the due date (never the task
+itself), and adding a new event by hand in the Tasks calendar creates a
+task for it. Separately, two Google Tasks lists this app manages —
+"Planner Inbox" and "Planner Today" — turn Google Assistant/Gemini voice
+commands into real tasks and a spoken read-out of today's plan: "Hey
+Google, add renew passport to my Planner Inbox list" gets AI-sorted the
+same way typing does, and "what's on my Planner Today list?" reads out
+today's plan, with completions flowing back. Both run on their own every
+~10 minutes — nothing to click, day to day. See
+`docs/07-what-we-built-two-way-sync-and-voice.md` for the plain-English
+"why" and `docs/RUNBOOK.md` section N for how to turn it on.
 
 Phase 8 turns the one capture box into the way to do everything, not just
 add tasks — the goal (the user's own words): "the less I need to fiddle
@@ -41,12 +56,13 @@ what you see. See `docs/05-what-we-built-weekly-review.md` for what
 changed and why, `docs/RUNBOOK.md` section L for how to turn it on, and
 `tools/weekly-review/README.md` for setting up the Claude side of it.
 
-That was the last of the phases from the original plan — a second round
-started after real daily use, of which Phase 8 (secretary mode, above) is
-the first. The app now covers capture, natural-language commands and
-questions, scheduling, AI sorting, install-to-home-screen, sharing from
-other apps, calendar reminders, and a weekly review, all on a Google Sheet
-you can always open and read directly.
+Phase 7 was the last of the phases from the original plan — a second round
+started after real daily use, of which Phase 8 (secretary mode) and Phase 9
+(two-way sync + voice, above) are the first two. The app now covers
+capture, natural-language commands and questions, scheduling, AI sorting,
+install-to-home-screen, sharing from other apps, two-way calendar
+reminders, a Google Tasks voice bridge, and a weekly review, all on a
+Google Sheet you can always open and read directly.
 
 Phase 6 adds real calendar reminders: every task with a due date gets an
 event (with a popup notification) in its own "Tasks" Google Calendar,
@@ -111,7 +127,7 @@ this repo, with the person driving the rebuild).
 | `icons/` | App icons (192/512/maskable/Apple touch), built by `tools/make-icons.mjs`. |
 | `tools/make-icons.mjs` | Generates the icon PNGs from scratch, no dependencies — run with `node tools/make-icons.mjs`. |
 | `apps-script/Code.gs` | The Google Apps Script backend (paste into the Apps Script editor). |
-| `apps-script/appsscript.json` | The Apps Script project manifest (timezone, web app settings). |
+| `apps-script/appsscript.json` | The Apps Script project manifest (timezone, web app settings, advanced services). |
 | `docs/RUNBOOK.md` | Exact click-by-click steps: setup, deploying changes, rotating the device key, testing, installing on devices. |
 | `docs/00-what-we-built-security.md` | Plain-English explanation of what Phase 0 fixed and why. |
 | `docs/01-what-we-built-data-and-ui.md` | Plain-English explanation of what Phase 2 built and why. |
@@ -120,6 +136,7 @@ this repo, with the person driving the rebuild).
 | `docs/04-what-we-built-share-and-reminders.md` | Plain-English explanation of what Phases 5 and 6 built and why. |
 | `docs/05-what-we-built-weekly-review.md` | Plain-English explanation of what Phase 7 built and why. |
 | `docs/06-what-we-built-secretary-mode.md` | Plain-English explanation of what Phase 8 built and why. |
+| `docs/07-what-we-built-two-way-sync-and-voice.md` | Plain-English explanation of what Phase 9 built and why. |
 | `tools/weekly-review/` | The Claude-side weekly review kit: `export.ps1`/`save.ps1` (PowerShell, call the backend), `PROMPT.md` (the scheduled task's exact instructions), `README.md` (setup steps). |
 
 ## Getting started
