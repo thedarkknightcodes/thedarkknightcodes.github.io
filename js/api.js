@@ -440,6 +440,101 @@ function mockCapture(tasks, payload) {
   return { ok: true, tasks: rows.map(cloneTask), source: source };
 }
 
+// --- fake secretary mode (mock assist) -----------------------------------
+// A rough stand-in for what the real `assist` action does: read a little
+// intent out of the wording (a completion, a "someday", a "move X to
+// day", a question) and act on the FIRST real task title it finds. Not
+// smart at all — it only exists so `?mock=1` can demonstrate all four
+// reply-card states (a plain capture, a command, a question, and "didn't
+// understand") without a real backend or Gemini key.
+
+const MOCK_WEEKDAY_NAMES = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+
+/** Resolves "friday"/"tomorrow"/"today"/etc, relative to `todayStr_`, to a
+ * real YYYY-MM-DD — a tiny stand-in for what the real assist prompt asks
+ * Gemini to do properly with full date reasoning. */
+function mockResolveDay_(word, todayStr_) {
+  if (word === "today") return todayStr_;
+  if (word === "tomorrow") return addDays(todayStr_, 1);
+  const targetIdx = MOCK_WEEKDAY_NAMES.indexOf(word);
+  if (targetIdx === -1) return todayStr_;
+  const parts = todayStr_.split("-").map(Number);
+  const d = new Date(parts[0], parts[1] - 1, parts[2]);
+  let diff = targetIdx - d.getDay();
+  if (diff <= 0) diff += 7; // "friday" always means the NEXT Friday, never today/already-passed this week
+  return addDays(todayStr_, diff);
+}
+
+/** Finds the first non-dropped task whose title contains this fragment —
+ * the mock's very rough version of the real assist prompt's "match
+ * generously" id-matching rule. */
+function mockFindTaskByFragment(tasks, fragment) {
+  const f = String(fragment || "").trim().toLowerCase();
+  if (!f) return null;
+  return tasks.find(function (t) { return t.status !== "dropped" && t.title.toLowerCase().indexOf(f) !== -1; }) || null;
+}
+
+function mockAssist(tasks, payload) {
+  const raw = String((payload && payload.raw) || "").trim();
+  if (!raw) return { ok: false, error: "missing_text" };
+
+  const lower = raw.toLowerCase();
+  const now = new Date().toISOString();
+  const today = todayStr();
+
+  // "I did the X" / "did the X" / "done with X" / "finished the X" -> complete
+  let m = lower.match(/\b(?:i did|did the|done with|finished)\s+(?:the\s+)?([a-z0-9 '&-]{3,40})/);
+  if (m) {
+    const task = mockFindTaskByFragment(tasks, m[1]);
+    if (task) {
+      task.status = "done";
+      task.completed_at = task.completed_at || now;
+      task.updated_at = now;
+      return { ok: true, intent: "command", reply: "Nice — marked \"" + task.title + "\" done.", tasks: [], updated: [cloneTask(task)], source: "ai" };
+    }
+  }
+
+  // "put/move the X in(to)/to someday" -> someday
+  m = lower.match(/\b(?:put|move)\s+(?:the\s+)?([a-z0-9 '&-]{3,40}?)\s+(?:in(?:to)?|to)\s+someday\b/);
+  if (m) {
+    const task = mockFindTaskByFragment(tasks, m[1]);
+    if (task) {
+      task.status = "someday";
+      task.do_date = "";
+      task.updated_at = now;
+      return { ok: true, intent: "command", reply: "Parked \"" + task.title + "\" in Someday.", tasks: [], updated: [cloneTask(task)], source: "ai" };
+    }
+  }
+
+  // "move the X to friday/tomorrow/..." -> schedule
+  m = lower.match(/\bmove\s+(?:the\s+)?([a-z0-9 '&-]{3,40}?)\s+to\s+(friday|monday|tuesday|wednesday|thursday|saturday|sunday|tomorrow|today)\b/);
+  if (m) {
+    const task = mockFindTaskByFragment(tasks, m[1]);
+    if (task) {
+      task.do_date = mockResolveDay_(m[2], today);
+      if (task.status === "inbox" || task.status === "someday") task.status = "active";
+      task.updated_at = now;
+      return { ok: true, intent: "command", reply: "Done — \"" + task.title + "\" moved to " + m[2] + ".", tasks: [], updated: [cloneTask(task)], source: "ai" };
+    }
+  }
+
+  // A plain question -> a canned, data-flavoured answer, no changes at all
+  if (/what'?s due|what is due|\?\s*$/.test(lower)) {
+    const dueSoon = tasks
+      .filter(function (t) { return t.status === "active" && t.due_date && t.due_date >= today; })
+      .sort(function (a, b) { return String(a.due_date).localeCompare(String(b.due_date)); });
+    const reply = dueSoon.length
+      ? "Coming up: " + dueSoon.slice(0, 3).map(function (t) { return t.title; }).join(", ") + "."
+      : "Nothing due that I can see — a clean stretch ahead.";
+    return { ok: true, intent: "question", reply: reply, tasks: [], updated: [], source: "ai" };
+  }
+
+  // Nothing above matched — treat it as a plain brain-dump, via the same
+  // fake splitter `capture` already uses.
+  const captured = mockCapture(tasks, payload);
+  return Object.assign({}, captured, { intent: "capture", reply: "", updated: [] });
+}
+
 async function mockCall(action, payload) {
   await delay(260 + Math.random() * 80);
   const tasks = ensureMockSeed();
@@ -458,6 +553,12 @@ async function mockCall(action, payload) {
     // row / "Sorting…" state actually has something to show off.
     await delay(900 + Math.random() * 300);
     return mockCapture(tasks, payload);
+  }
+  if (action === "assist") {
+    // Phase 8: same fake "thinking time" as capture, so the pending row's
+    // "Thinking…" state actually has something to show off too.
+    await delay(900 + Math.random() * 300);
+    return mockAssist(tasks, payload);
   }
   if (action === "review_get") return { ok: true, review: ensureMockReview() };
   if (action === "review_dismiss") { mockReview = null; return { ok: true }; }

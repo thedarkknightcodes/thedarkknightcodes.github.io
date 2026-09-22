@@ -473,3 +473,72 @@ Edit that line, then run **`installTriggers`** again (always safe — see
 step 3 above). **`removeTriggers`** turns off both the nightly tidy and
 the weekly review if you ever want to pause either.
 
+---
+
+## M. Phase 8: secretary mode
+
+The capture box is now the way to do everything, not just add tasks: type
+or dictate a brain-dump as before, or a command ("move the dentist to
+Friday", "I did the recycling", "put the photo albums in someday"), or a
+plain question ("what's due this week?", "how many things are in
+someday?"). One new backend action, `assist`, decides which it was and
+replies underneath the box — see `docs/06-what-we-built-secretary-mode.md`
+for the plain-English "why". Nothing it does is one-way: every change is
+an ordinary task update, so a misread command is one **Undo** away (in the
+reply card itself) and, as always in this app, nothing is ever deleted.
+
+1. Replace the contents of `Code.gs` with the latest `apps-script/Code.gs`
+   from this repo (section C), and save.
+2. *(Optional)* If you want to point at a different Gemini model than this
+   version's default, the `GEMINI_MODEL` Script Property still works
+   exactly as before (section I) — set it under **Project Settings →
+   Script Properties**. Most people can leave this alone: this version
+   defaults to `gemini-3.8-flash` instead of the older, lighter
+   `gemini-3.5-flash-lite`, because deciding "is this a new task, a change
+   to something that already exists, or just a question" needs a bit more
+   reasoning than plain brain-dump splitting did.
+3. Function dropdown → **`runTests`** → **Run**. Should end with "All …
+   tests passed." (this now also covers `parseAssistResult_` and its
+   helpers — all local checks, no network).
+4. Function dropdown → **`test_assist`** → **Run**. This sends one sample
+   line to Gemini against your REAL tasks, in a **dry run** — it reads
+   your data for context but writes nothing to Tasks2 or Log either way.
+   Open **Execution log** and check the parsed intent/reply/new_tasks/ops
+   look sensible. (If you want to try your own wording, edit `sampleRaw`
+   near the top of `test_assist()` in `Code.gs` first.)
+5. Ship it: **Deploy → Manage deployments → pencil icon → Version: New
+   version → Deploy** (section C — same URL, no config change).
+6. Open the app, click **Ping** in Settings → version should now read
+   `0.6.0`.
+7. Try a few things in the capture box for real:
+   - A command: **"move the dentist to Friday"**, **"I did the
+     recycling"**, **"put the photo albums in someday"**, **"drop the
+     spanish thing"**, **"make brushing teeth a 5 min task in health"**,
+     **"schedule the car insurance for tomorrow at 9"**.
+   - A question: **"what's due this week?"**, **"what should I do in the
+     next 20 minutes?"**, **"what did I get done today?"**.
+   - A mix: **"I did the rubbish, and remind me to call mum sunday"**.
+   Each one should show "Thinking…" briefly on the box, then either new
+   tasks appearing (a capture), or a short reply card underneath the box
+   (a command or a question) with an **Undo** button if anything actually
+   changed. A command it couldn't confidently match to a task instead asks
+   in the reply card — try answering it, or just rephrasing more like the
+   task's real title.
+8. The first time `assist` succeeds on a device, a small first-run hint
+   under the box ("Type or dictate anything…") disappears for good on that
+   device — nothing to do here, it's just `localStorage`, and Settings
+   always has the same tip as a permanent one-liner if you want it back.
+
+**If a command didn't do what you expected:** open the reply card's
+**Undo** (if it's still showing) — it restores every task that command
+touched to exactly how it was before. If the card's already gone, the
+change is still just an ordinary task edit — open the task from Today or
+Week and fix it by hand the normal way; nothing `assist` does is special
+or harder to undo than a tap would have been.
+
+**Why `capture` still exists as its own action:** the Android share-target
+flow (section J) still uses it — a share is always just a brain-dump, with
+no box to type a command or question into, so there's nothing `assist`
+would add there. Everything typed or dictated into the capture box itself
+goes through `assist`.
+

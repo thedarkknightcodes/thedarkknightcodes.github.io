@@ -21,6 +21,12 @@ import * as ui from "./ui.js";
 
 const RETRY_DELAYS_MS = [2000, 5000, 15000, 60000];
 
+// Phase 8: once the first `assist` call ever succeeds on this device, the
+// "the box understands commands and questions too" hint under the capture
+// box (see ui.js's showCaptureHint) never needs to show again — see
+// hasSeenAssistHint/markAssistHintSeen below.
+const HINT_SEEN_KEY = "planner.hintSeen";
+
 // Shown in Settings so you can tell at a glance whether a device has
 // picked up the latest app shell yet. Keep this in sync by hand with
 // CACHE_VERSION in sw.js whenever you bump one — they're two separate
@@ -85,6 +91,14 @@ async function flushQueue() {
       try {
         const result = await api.api(op.action, op.payload);
         if (op.action === "capture") applyCaptureResult(op, result.data);
+        if (op.action === "assist") {
+          applyAssistResult(op, result.data);
+          // "Shown until the first assist succeeds" — this is that moment,
+          // whichever way it went (a real AI answer or the safe fallback);
+          // either way the box has now visibly done its secretary-mode
+          // thing at least once.
+          markAssistHintSeen();
+        }
         if (op.action === "review_apply") applyReviewApplyResult(result.data);
         store.dequeueOp(op.op_id);
         retryAttempt = 0;
@@ -99,12 +113,12 @@ async function flushQueue() {
           ui.showKeyScreen(err.code === "locked" ? "Too many attempts — try again in a few minutes." : "");
           return;
         }
-        if (op.action === "capture") {
+        if (op.action === "capture" || op.action === "assist") {
           // The server refused this outright (e.g. an empty raw somehow
           // got this far) rather than a network blip — nothing was saved,
           // and nothing here can succeed by retrying, so just say so.
           store.dequeueOp(op.op_id);
-          ui.showToast("That capture didn't save — try again.");
+          ui.showToast(op.action === "assist" ? "That didn't save — try again." : "That capture didn't save — try again.");
           continue;
         }
         // Some other ApiError: this op can never succeed as-is. Drop it,
@@ -177,21 +191,25 @@ function applyFieldUpdate(task, fields, toastMessage) {
 }
 
 /**
- * The main capture flow (Phase 4): one messy ramble goes to the backend as
- * a single `capture` op, and Gemini splits it into tasks server-side. We
- * never wait for that reply before confirming — the op is queued (so it
- * survives a reload and retries itself if you're offline) and a toast
- * fires immediately. `todayOn` is remembered on the op itself so that, once
- * the AI result eventually comes back, we can honour the "Today" chip for
- * whichever of ITS tasks the AI left undated (see applyCaptureResult).
- */
-/**
+ * The one thing the capture box does now (Phase 8: "secretary mode"): send
+ * whatever was typed or dictated to the backend's `assist` action, which
+ * decides for itself whether it's a brain-dump, a command ("move the
+ * dentist to Friday"), a plain question, or some mix — see
+ * applyAssistResult for how each of those shows up. We never wait for that
+ * reply before confirming — the op is queued (so it survives a reload and
+ * retries itself if you're offline) and a toast fires immediately.
+ * `todayOn` is remembered on the op itself so that, once the result comes
+ * back, we can honour the "Today" chip for whichever newly-created tasks
+ * were left undated (see applyAssistResult) — exactly the same rule a
+ * plain capture always had, just now living in one more code path.
+ *
  * `sourceHint` is "typed" (the normal capture box, the default) or "share"
  * (Phase 5: arrived via Android's share sheet — see readShareTarget()
- * below). It rides along on the capture payload purely so the backend's
- * Log tab can tell the two apart later ("capture:share" vs
- * "capture:typed") — it changes nothing else about how the capture is
- * handled.
+ * below). A share is always just a brain-dump — there's no box to type a
+ * command or question into on that path — so it deliberately keeps using
+ * the older, simpler `capture` action rather than `assist`; there's
+ * nothing extra `assist` would buy it there, and it's one less thing that
+ * could behave surprisingly for a flow the person never even sees happen.
  */
 function handleCapture(raw, todayOn, sourceHint) {
   const trimmed = String(raw || "").trim();
@@ -199,16 +217,37 @@ function handleCapture(raw, todayOn, sourceHint) {
 
   const today = store.getState().serverToday;
   const opId = logic.randomId();
+  const hint = sourceHint || "typed";
+  const action = hint === "share" ? "capture" : "assist";
 
   store.enqueueOp({
     op_id: opId,
-    action: "capture",
-    payload: { raw: trimmed, op_id: opId, today_hint: today, source_hint: sourceHint || "typed" },
+    action: action,
+    payload: { raw: trimmed, op_id: opId, today_hint: today, source_hint: hint },
     todayOn: !!todayOn,
   });
   flushQueue();
 
   ui.showToast("Got it ✓");
+}
+
+// --- Phase 8: the first-run "the box understands commands too" hint -------
+
+function hasSeenAssistHint() {
+  try {
+    return localStorage.getItem(HINT_SEEN_KEY) === "1";
+  } catch (err) {
+    return true; // storage unavailable — safest default is "don't nag"
+  }
+}
+
+function markAssistHintSeen() {
+  try {
+    localStorage.setItem(HINT_SEEN_KEY, "1");
+  } catch (err) {
+    // Not critical — worst case the hint shows again next time.
+  }
+  ui.hideCaptureHint();
 }
 
 /**
@@ -242,6 +281,87 @@ function applyCaptureResult(op, data) {
   }
 
   highlightTaskIds(tasks.map(function (t) { return t.id; }));
+}
+
+/**
+ * Runs once an `assist` op's server response comes back (Phase 8). Merges
+ * whatever it created and changed into the store — exactly like
+ * applyCaptureResult for the created tasks, plus `updated` for anything an
+ * `op` changed (a completion, a reschedule, a drop, ...) — then, if there's
+ * a `reply` worth showing, puts it in the reply card under the capture box.
+ *
+ * There's no explicit "this was a clarifying question" flag in the
+ * response, so it's inferred the same way a person would read it: if
+ * Gemini said something back but didn't actually create or change
+ * anything, it must have been asking rather than telling (see
+ * buildAssistPrompt_ in Code.gs — "if you can't tell which task they mean,
+ * ask in `reply` and emit no op for it"). That's also exactly when it's
+ * worth sending focus back to the box, so the next thing typed is
+ * naturally the answer.
+ */
+function applyAssistResult(op, data) {
+  const created = data.tasks || [];
+  const updated = data.updated || [];
+  const today = store.getState().serverToday;
+
+  // Snapshot each updated task's PREVIOUS state, straight from the store,
+  // BEFORE this op's changes land — what the reply card's single Undo
+  // button restores, the same idea as applyFieldUpdate's toast Undo for a
+  // single hand-edit, just covering however many tasks one command
+  // touched instead of one.
+  const previousById = new Map();
+  for (const task of updated) {
+    const existing = store.getState().tasks.find(function (t) { return t.id === task.id; });
+    if (existing) previousById.set(task.id, Object.assign({}, existing));
+  }
+
+  for (const task of created) store.upsertTask(task);
+  for (const task of updated) store.upsertTask(task);
+
+  if (op.todayOn) {
+    for (const task of created) {
+      // Only fill in a date the AI left blank — an AI-chosen date (or one
+      // it correctly left off because it was a "someday" kind of item)
+      // always wins over the chip. Same rule as applyCaptureResult.
+      if (!task.do_date && !task.due_date) {
+        store.patchTask(task.id, { do_date: today });
+        queueUpdate(task.id, { do_date: today });
+      }
+    }
+  }
+
+  if (data.source === "fallback") {
+    ui.showToast("Saved as one note for now — you can split it later.");
+  }
+
+  highlightTaskIds(created.map(function (t) { return t.id; }));
+
+  const reply = String(data.reply || "").trim();
+  if (!reply) return;
+
+  const madeAChange = created.length > 0 || updated.length > 0;
+  // A "question" always stays up till dismissed; so does anything that
+  // said something back without actually doing anything — see this
+  // function's own comment for why that's read as "was asking, not
+  // telling", not just for a literal intent:"question".
+  const isQuestion = data.intent === "question" || !madeAChange;
+
+  const onUndo = updated.length
+    ? function () {
+        for (const task of updated) {
+          const previous = previousById.get(task.id);
+          if (!previous) continue;
+          store.patchTask(task.id, previous);
+          queueUpdate(task.id, {
+            title: previous.title, notes: previous.notes, category: previous.category,
+            est_min: previous.est_min, status: previous.status, do_date: previous.do_date,
+            due_date: previous.due_date, due_time: previous.due_time,
+          });
+        }
+      }
+    : null;
+
+  ui.showReplyCard(reply, { isQuestion: isQuestion, onUndo: onUndo, focusBox: isQuestion && !madeAChange });
 }
 
 /** Marks a set of task ids as "just arrived" for one render, then clears
@@ -318,13 +438,14 @@ function handleToggleDone(task) {
 
 function buildPendingCaptures(state) {
   return state.queue
-    .filter(function (op) { return op.action === "capture"; })
+    .filter(function (op) { return op.action === "capture" || op.action === "assist"; })
     .map(function (op) {
       const raw = (op.payload && op.payload.raw) || "";
       return {
         op_id: op.op_id,
         preview: raw.slice(0, 40),
         waiting: state.syncStatus === "retry",
+        thinking: op.action === "assist",
       };
     });
 }
@@ -658,6 +779,14 @@ async function init() {
 
   ui.init(topHandlers);
   store.subscribe(render);
+
+  // Phase 8: the "the box understands commands too" hint — see
+  // hasSeenAssistHint/markAssistHintSeen.
+  if (!hasSeenAssistHint()) {
+    ui.showCaptureHint(
+      "Type or dictate anything: things to do, \"I did the dentist\", \"move X to Friday\", or a question."
+    );
+  }
 
   const hasKey = api.isMockMode() || !!api.loadDeviceKey();
   if (hasKey) ui.showMainScreen();

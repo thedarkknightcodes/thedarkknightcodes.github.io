@@ -11,7 +11,22 @@ security and reliability problems (see `docs/00-what-we-built-security.md`
 for the first one fixed). It's being replaced a phase at a time, with each
 phase actually used for a while before the next one starts.
 
-## Current status: Phase 7 — weekly review (all planned phases done)
+## Current status: Phase 8 — secretary mode
+
+Phase 8 turns the one capture box into the way to do everything, not just
+add tasks — the goal (the user's own words): "the less I need to fiddle
+with the app and the more I can just use natural language/voice to let AI
+do the manipulation, the better." Type or dictate a brain-dump as before,
+or a command ("move the dentist to Friday", "I did the recycling", "put
+the photo albums in someday"), or a plain question ("what's due this
+week?"), or a mix of any of those in one go. A new backend action,
+`assist`, decides which it was — new tasks go through the same rules as a
+plain capture; changes to existing tasks are validated against the exact
+task ids Gemini was actually shown, so a hallucinated id or an
+unrecognised instruction can never touch your data. A short reply shows
+under the box, with an Undo for anything it changed. See
+`docs/06-what-we-built-secretary-mode.md` for what changed and why, and
+`docs/RUNBOOK.md` section M for how to turn it on.
 
 Phase 7 adds a weekly review: once a week, a short, warm summary of the
 week just gone (1–3 concrete wins, never a count of what's undone), plus a
@@ -26,10 +41,12 @@ what you see. See `docs/05-what-we-built-weekly-review.md` for what
 changed and why, `docs/RUNBOOK.md` section L for how to turn it on, and
 `tools/weekly-review/README.md` for setting up the Claude side of it.
 
-This is the last of the planned phases — the app now covers capture,
-scheduling, AI sorting, install-to-home-screen, sharing from other apps,
-calendar reminders, and a weekly review, all on a Google Sheet you can
-always open and read directly.
+That was the last of the phases from the original plan — a second round
+started after real daily use, of which Phase 8 (secretary mode, above) is
+the first. The app now covers capture, natural-language commands and
+questions, scheduling, AI sorting, install-to-home-screen, sharing from
+other apps, calendar reminders, and a weekly review, all on a Google Sheet
+you can always open and read directly.
 
 Phase 6 adds real calendar reminders: every task with a due date gets an
 event (with a popup notification) in its own "Tasks" Google Calendar,
@@ -102,6 +119,7 @@ this repo, with the person driving the rebuild).
 | `docs/03-what-we-built-ai-capture.md` | Plain-English explanation of what Phase 4 built and why. |
 | `docs/04-what-we-built-share-and-reminders.md` | Plain-English explanation of what Phases 5 and 6 built and why. |
 | `docs/05-what-we-built-weekly-review.md` | Plain-English explanation of what Phase 7 built and why. |
+| `docs/06-what-we-built-secretary-mode.md` | Plain-English explanation of what Phase 8 built and why. |
 | `tools/weekly-review/` | The Claude-side weekly review kit: `export.ps1`/`save.ps1` (PowerShell, call the backend), `PROMPT.md` (the scheduled task's exact instructions), `README.md` (setup steps). |
 
 ## Getting started

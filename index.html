@@ -81,6 +81,17 @@
           <p id="capture-feedback" class="capture-feedback" aria-live="polite"></p>
         </form>
 
+        <!-- Phase 8: a short first-run hint that the box now understands
+             commands and questions too, not just brain-dumps. Shown until
+             the first `assist` call succeeds (see app.js's markAssistHintSeen),
+             then never again on this device. -->
+        <p id="capture-hint" class="capture-hint" hidden></p>
+
+        <!-- Phase 8: the reply card for a command/question answered through
+             the capture box — see app.js's applyAssistResult and
+             ui.js's showReplyCard. -->
+        <div id="reply-card" class="card reply-card" hidden></div>
+
         <div id="pending-captures" class="pending-captures" aria-live="polite"></div>
         <button type="button" id="inbox-link" class="inbox-link" hidden></button>
 

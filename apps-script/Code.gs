@@ -44,11 +44,29 @@
  * review_save, review_get, review_dismiss and review_apply below for the
  * whole flow, and validateReview_ for the one rule that keeps a
  * hallucinated task id or an overlong list from ever reaching the sheet.
+ *
+ * Phase 8 ("secretary mode") turns the ONE capture box into the way to do
+ * everything, so there's as little screen-fiddling as possible between
+ * "I thought of something" and it being handled — the whole point of a
+ * text/voice box over a form. Typing (or dictating) a brain-dump still
+ * creates tasks as before, but a command ("move the dentist to Friday",
+ * "I did the recycling") now changes existing tasks, and a plain question
+ * ("what's due this week?") gets a short spoken-style answer — all through
+ * one new action, `assist`. It works the same defensive way `capture`
+ * does (raw text logged FIRST, a safe one-Inbox-task fallback if Gemini is
+ * ever unreachable or sends back nonsense) but additionally shows Gemini a
+ * compact list of existing tasks and lets it emit `ops` against them —
+ * see doAssistInternal_'s comment for the full flow, and parseAssistResult_
+ * for the one rule that keeps a hallucinated task id or an unrecognised
+ * op from ever reaching the sheet. Nothing an op does is one-way: every
+ * change it makes is an ordinary task update, so the app's own Undo (and
+ * the fact that this app never deletes anything) covers a misread command
+ * exactly the same as a mis-tap would.
  */
 
 // Bump this whenever you deploy a meaningfully different version. `ping`
 // returns it, so the phone/browser can show you which code it's talking to.
-const CODE_VERSION = "0.5.0";
+const CODE_VERSION = "0.6.0";
 
 // The app's own URL, used in calendar event descriptions ("Open: ...") so
 // a reminder always has a one-tap way back into the app.
@@ -92,7 +110,13 @@ const TASKS2_HEADERS = [
   "created_at", "updated_at", "completed_at", "last_touched_at",
   "calendar_event_id", "source", "raw_input", "op_id",
 ];
-const LOG_HEADERS = ["at", "source", "raw_text", "result"];
+// Phase 8: `op_id` lets an `assist` retry find its own earlier result
+// instead of asking Gemini (and the sheet) to redo the same work — see
+// findStoredAssistResult_. ensureTab_ adds this column to an EXISTING Log
+// tab automatically the first time this version runs (see that function's
+// comment) — older rows just show blank in it, which is fine, they were
+// never retried against.
+const LOG_HEADERS = ["at", "source", "raw_text", "result", "op_id"];
 const REVIEWS_HEADERS = ["week_start", "source", "created_at", "json", "dismissed_at"];
 
 // Only these Tasks2 fields can be changed by an `update` request. Anything
@@ -118,11 +142,15 @@ const FADE_DAYS = 21;
 // GEMINI CAPTURE CONSTANTS (Phase 4)
 // ---------------------------------------------------------------------------
 
-// Which Gemini model to call. This is just a starting point — Google
-// renames/retires model names occasionally, so the GEMINI_MODEL Script
-// Property (if set) always wins over this default. See docs/RUNBOOK.md
-// section I.
-const GEMINI_MODEL_DEFAULT = "gemini-3.5-flash-lite";
+// Which Gemini model to call — used by both `capture` and `assist`. This
+// is just a starting point — Google renames/retires model names
+// occasionally, so the GEMINI_MODEL Script Property (if set) always wins
+// over this default. See docs/RUNBOOK.md section I (and section M for
+// `assist`, which is what actually needs the extra reasoning a bigger
+// model like this gives you — deciding "is this a new task, a change to
+// an old one, or a question" is a harder job than just splitting a
+// brain-dump into lines).
+const GEMINI_MODEL_DEFAULT = "gemini-3.8-flash";
 
 // A brain-dump longer than this is trimmed before it's sent anywhere. This
 // isn't really about Gemini's limits (it can handle far more) — it's a
@@ -159,6 +187,85 @@ const GEMINI_RESPONSE_SCHEMA = {
     },
   },
   required: ["tasks"],
+};
+
+// ---------------------------------------------------------------------------
+// ASSIST / SECRETARY MODE CONSTANTS (Phase 8)
+// ---------------------------------------------------------------------------
+
+// The full list of changes an `assist` op can make to an EXISTING task.
+// Anything Gemini sends that isn't one of these exact words is dropped by
+// parseAssistResult_ — never guessed at, never partially applied.
+const ASSIST_OPS = [
+  "complete", "uncomplete", "drop", "someday", "restore",
+  "schedule", "unschedule", "set_due", "clear_due", "edit",
+];
+
+// The full list of "meanings" one thing typed/dictated into the box can
+// have. "mixed" covers a single ramble that's part brain-dump, part
+// command ("I did the rubbish, and remind me to call mum sunday").
+const ASSIST_INTENTS = ["capture", "command", "question", "mixed"];
+
+// How many existing tasks get shown to Gemini as context for one `assist`
+// call — see selectAssistContextTasks_. A cap, not a target: most days
+// every visible task fits comfortably under this, and this only starts
+// trimming once the list is genuinely long.
+const ASSIST_MAX_CONTEXT_TASKS = 150;
+
+// However many things one ramble asks to change, we only ever act on this
+// many — same "keep it from turning into its own overwhelming wall of
+// changes" reasoning as GEMINI_MAX_TASKS.
+const ASSIST_MAX_OPS = 20;
+
+// A reply longer than this is trimmed — `reply` is meant to be at most a
+// few short sentences (see buildAssistPrompt_), this is just a backstop.
+const ASSIST_REPLY_MAX_CHARS = 600;
+
+// The shape we force Gemini's `assist` reply into. `new_tasks` reuses the
+// exact same per-task shape as a plain capture (see GEMINI_RESPONSE_SCHEMA
+// above); `ops` is the new bit — a change to something that already
+// exists, named by the exact id parseAssistResult_ was shown.
+const ASSIST_RESPONSE_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    intent: { type: "STRING", enum: ASSIST_INTENTS },
+    reply: { type: "STRING" },
+    new_tasks: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          title: { type: "STRING" },
+          notes: { type: "STRING" },
+          category: { type: "STRING", enum: CATEGORIES },
+          est_min: { type: "INTEGER" },
+          do_date: { type: "STRING" },
+          due_date: { type: "STRING" },
+          due_time: { type: "STRING" },
+        },
+        required: ["title", "category"],
+      },
+    },
+    ops: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          op: { type: "STRING", enum: ASSIST_OPS },
+          id: { type: "STRING" },
+          do_date: { type: "STRING" },
+          due_date: { type: "STRING" },
+          due_time: { type: "STRING" },
+          title: { type: "STRING" },
+          notes: { type: "STRING" },
+          category: { type: "STRING", enum: CATEGORIES },
+          est_min: { type: "INTEGER" },
+        },
+        required: ["op", "id"],
+      },
+    },
+  },
+  required: ["intent", "reply", "new_tasks", "ops"],
 };
 
 // ---------------------------------------------------------------------------
@@ -239,6 +346,7 @@ const ACTIONS = {
   add: doAdd,
   update: doUpdate,
   capture: doCapture,
+  assist: doAssist,
   digest_preview: doDigestPreview,
   review_export: doReviewExport,
   review_save: doReviewSave,
@@ -547,7 +655,7 @@ function doCapture(request) {
 
   const logSheet = ss.getSheetByName(LOG_SHEET_NAME);
   const logHeaders = getHeaders_(logSheet);
-  const logRow = appendLogRow_(logSheet, logHeaders, nowIso, "capture:" + sourceHint, raw, "pending");
+  const logRow = appendLogRow_(logSheet, logHeaders, nowIso, "capture:" + sourceHint, raw, "pending", opId);
 
   let geminiTasks = null;
   let failureReason = "";
@@ -583,29 +691,11 @@ function doCapture(request) {
     rows = [buildFallbackTask_(raw, Utilities.getUuid(), nowIso)];
   }
 
-  const lock = LockService.getScriptLock();
-  lock.waitLock(10000);
-  let savedTasks;
-  try {
-    const sheet = ensureTabs_(ss);
-    const headers = getHeaders_(sheet);
-    const values = rows.map(function (row) {
-      row.op_id = opId;
-      return taskToRowValues_(headers, row);
-    });
-    const startRow = sheet.getLastRow() + 1;
-    sheet.getRange(startRow, 1, values.length, headers.length).setValues(values);
-
-    // One calendar sync per new task, same "after the sheet write, never
-    // lets Calendar block the save" rule as doAdd/doUpdate.
-    savedTasks = values.map(function (rowValues, i) {
-      const task = rowToTask_(headers, rowValues);
-      task.calendar_event_id = syncTaskEvent_(sheet, headers, startRow + i, task);
-      return task;
-    });
-  } finally {
-    lock.releaseLock();
-  }
+  const sheet = ensureTabs_(ss);
+  const headers = getHeaders_(sheet);
+  // Writing the new rows (and syncing each one's calendar event) is shared
+  // with doAssist's fallback path — see writeNewTaskRows_'s comment.
+  const savedTasks = writeNewTaskRows_(sheet, headers, rows, opId);
 
   const resultText = source === "ai" ? "ok:" + savedTasks.length + " tasks" : "fallback: " + failureReason;
   updateLogResult_(logSheet, logHeaders, logRow, resultText);
@@ -613,6 +703,47 @@ function doCapture(request) {
   const response = { ok: true, tasks: savedTasks, source: source };
   if (source === "fallback") response.reason = failureReason;
   return response;
+}
+
+/**
+ * Appends already-validated Tasks2 rows to the sheet in one batch, syncs
+ * each new row's calendar event, and returns the saved task objects. Shared
+ * by doCapture and doAssistInternal_'s fallback/new_tasks paths — this is
+ * the "60 lines duplicated between capture and assist" the Phase 8 brief
+ * asked to avoid. The caller must already hold the script lock (see
+ * writeNewTaskRows_ below for the version that takes its own).
+ */
+function appendTaskRows_(sheet, headers, rows, opId) {
+  if (!rows.length) return [];
+  const values = rows.map(function (row) {
+    row.op_id = opId;
+    return taskToRowValues_(headers, row);
+  });
+  const startRow = sheet.getLastRow() + 1;
+  sheet.getRange(startRow, 1, values.length, headers.length).setValues(values);
+
+  // One calendar sync per new task, same "after the sheet write, never
+  // lets Calendar block the save" rule as doAdd/doUpdate.
+  return values.map(function (rowValues, i) {
+    const task = rowToTask_(headers, rowValues);
+    task.calendar_event_id = syncTaskEvent_(sheet, headers, startRow + i, task);
+    return task;
+  });
+}
+
+/** appendTaskRows_, wrapped in its own script lock — what doCapture (and
+ * doAssistInternal_'s fallback, which doesn't need to coordinate its write
+ * with anything else) use. doAssistInternal_'s AI-result path calls
+ * appendTaskRows_ directly instead, because it needs the SAME lock to also
+ * cover its `ops` updates — see applyAssistWrites_. */
+function writeNewTaskRows_(sheet, headers, rows, opId) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    return appendTaskRows_(sheet, headers, rows, opId);
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -671,13 +802,16 @@ function callGemini_(raw, todayStr) {
 }
 
 /** Appends one row to the Log tab and returns its 1-based sheet row number,
- * so the caller can come back later and fill in the `result` column. */
-function appendLogRow_(sheet, headers, at, source, rawText, result) {
+ * so the caller can come back later and fill in the `result` column.
+ * `opId` is optional (doCapture's early callers before Phase 8 didn't have
+ * one to pass) — it's what findStoredAssistResult_ later searches on. */
+function appendLogRow_(sheet, headers, at, source, rawText, result, opId) {
   const row = headers.map(function (h) {
     if (h === "at") return at;
     if (h === "source") return source;
     if (h === "raw_text") return rawText;
     if (h === "result") return result;
+    if (h === "op_id") return opId || "";
     return "";
   });
   sheet.appendRow(row);
@@ -708,6 +842,490 @@ function findTasksByOpId_(sheet, headers, opId) {
     if (String(values[i][opIdCol] || "") === opId) matches.push(rowToTask_(headers, values[i]));
   }
   return matches;
+}
+
+// ---------------------------------------------------------------------------
+// SECRETARY MODE / `assist` (Phase 8) — sheet/network access, not pure
+// ---------------------------------------------------------------------------
+//
+// The whole flow, end to end (see doAssistInternal_):
+//   1. Log the raw text FIRST, same never-lose-it rule as capture — with
+//      the op_id, so a retry can find its own earlier result (step 2).
+//   2. Idempotency: if this exact op_id already finished once, hand back
+//      that same stored result instead of doing it all again.
+//   3. Build a compact list of existing tasks (selectAssistContextTasks_)
+//      and ask Gemini what the person meant — new tasks, changes to
+//      existing ones (by id, copied verbatim from that list), an answer,
+//      or some mix — via callGeminiAssist_ + parseAssistResult_.
+//   4. Apply it: new tasks the same way a plain capture does; each `op`
+//      mapped to an ordinary applyUpdate_ field bag (mapAssistOpToFields_)
+//      and written the same way a hand-edit would be, all under one lock
+//      (applyAssistWrites_) so the response is never half-applied.
+//   5. On any Gemini failure, fall back EXACTLY like doCapture does: the
+//      whole raw text saved as one Inbox task, nothing lost.
+
+/**
+ * Action `assist`: the one thing the capture box sends for everything now
+ * (see js/app.js's handleCapture) — a brain-dump, a command like "move the
+ * dentist to Friday", a question like "what's due this week?", or a mix.
+ * Thin wrapper around doAssistInternal_ so test_assist() can run the exact
+ * same logic in a dry run (no writes) from the Apps Script editor.
+ */
+function doAssist(request) {
+  return doAssistInternal_(request, false);
+}
+
+/**
+ * Run this by hand (function dropdown → `test_assist` → Run) any time you
+ * want to see how `assist` would read a real ramble against your ACTUAL
+ * tasks, without writing anything — see docs/RUNBOOK.md section M. Logs
+ * the parsed intent/reply/new_tasks/ops to the Execution log. Edit
+ * `sampleRaw` below to try your own wording.
+ */
+function test_assist() {
+  const sampleRaw =
+    "I did the recycling, move the dentist thing to friday, and what's due this week?";
+  Logger.log("test_assist: DRY RUN — nothing will be written to Tasks2 or Log.");
+  doAssistInternal_({ payload: { raw: sampleRaw, op_id: "", today_hint: todayString_() } }, true);
+}
+
+/**
+ * The real implementation behind both doAssist (dryRun=false, writes for
+ * real) and test_assist() (dryRun=true, reads your real tasks for context
+ * but never writes a row). See this section's header comment for the
+ * numbered flow.
+ */
+function doAssistInternal_(request, dryRun) {
+  const payload = request.payload || {};
+  const rawInput = String(payload.raw || "").trim();
+  const opId = String(payload.op_id || "");
+  // Same idea as doCapture's source_hint: purely so the Log tab can tell a
+  // typed ramble apart from a shared one later — changes nothing else.
+  const sourceHint = payload.source_hint === "share" ? "share" : "typed";
+  const nowIso = nowIso_();
+  const today = todayString_();
+
+  if (!rawInput) return { ok: false, error: "missing_text" };
+  const raw = rawInput.slice(0, GEMINI_MAX_RAW_CHARS);
+
+  const ss = getSpreadsheet_();
+  const tasksSheet = ensureTabs_(ss);
+  const tasksHeaders = getHeaders_(tasksSheet);
+  const logSheet = ss.getSheetByName(LOG_SHEET_NAME);
+  const logHeaders = getHeaders_(logSheet);
+
+  let logRowNum = null;
+  if (!dryRun) {
+    // Idempotency: a retried request with the SAME op_id (e.g. the first
+    // reply timed out on the way back but actually succeeded) gets back
+    // exactly what happened the first time, instead of possibly applying
+    // the same command twice.
+    if (opId) {
+      const previous = findStoredAssistResult_(logSheet, logHeaders, opId);
+      if (previous) return previous;
+    }
+    logRowNum = appendLogRow_(logSheet, logHeaders, nowIso, "assist:" + sourceHint, raw, "pending", opId);
+  }
+
+  const lastRow = tasksSheet.getLastRow();
+  const allTasks = lastRow < 2
+    ? []
+    : rowsToTasks_(tasksHeaders, tasksSheet.getRange(2, 1, lastRow - 1, tasksHeaders.length).getValues());
+  // Same "what would the app itself show you" rule as doList — a dropped
+  // task, or one done more than a week ago, isn't worth Gemini's attention
+  // (or the prompt's space) either.
+  const visibleTasks = filterVisibleTasks_(allTasks, nowIso);
+  const contextTasks = selectAssistContextTasks_(visibleTasks, ASSIST_MAX_CONTEXT_TASKS);
+  const knownIds = contextTasks.map(function (t) { return t.id; });
+
+  let assistResult = null;
+  let failureReason = "";
+  try {
+    const responseText = callGeminiAssist_(raw, today, contextTasks);
+    assistResult = parseAssistResult_(responseText, knownIds);
+  } catch (err) {
+    failureReason = errorMessage_(err);
+  }
+
+  if (dryRun) {
+    if (assistResult) {
+      Logger.log("test_assist: intent=" + assistResult.intent + "  reply=" + JSON.stringify(assistResult.reply));
+      Logger.log("test_assist: new_tasks =\n" + JSON.stringify(assistResult.new_tasks, null, 2));
+      Logger.log("test_assist: ops =\n" + JSON.stringify(assistResult.ops, null, 2));
+    } else {
+      Logger.log(
+        "test_assist: Gemini call/parse failed (" + failureReason + ") — real traffic would fall " +
+        "back to one Inbox task with the raw text. Nothing was written either way."
+      );
+    }
+    return { ok: true, dryRun: true, intent: assistResult ? assistResult.intent : "capture", reply: assistResult ? assistResult.reply : "" };
+  }
+
+  let response;
+  if (assistResult) {
+    response = applyAssistWrites_(tasksSheet, tasksHeaders, assistResult, raw, nowIso, opId);
+  } else {
+    // Exactly doCapture's fallback: the whole raw text, saved as one task
+    // in the Inbox, so a Gemini outage never loses what was typed/said.
+    const fallbackRow = buildFallbackTask_(raw, Utilities.getUuid(), nowIso);
+    const savedTasks = writeNewTaskRows_(tasksSheet, tasksHeaders, [fallbackRow], opId);
+    response = { ok: true, intent: "capture", reply: "", tasks: savedTasks, updated: [], source: "fallback", reason: failureReason || "no_usable_result" };
+  }
+
+  const resultText = "done:" + JSON.stringify(response).slice(0, 45000);
+  updateLogResult_(logSheet, logHeaders, logRowNum, resultText);
+  return response;
+}
+
+/**
+ * Looks in the Log tab for a previous `assist` call with this exact op_id
+ * that finished and stored a real result (its `result` column starts with
+ * "done:") — see doAssistInternal_ writing that after updateLogResult_. A
+ * row that's still "pending" (the process died mid-request) or failed some
+ * other way is NOT treated as a duplicate: it just runs again, same as if
+ * it had never been tried, since nothing was ever returned to the caller
+ * for it. Scans from the most recent row backwards since a duplicate, if
+ * one exists, is almost always near the end of the tab.
+ */
+function findStoredAssistResult_(sheet, headers, opId) {
+  if (!opId) return null;
+  const opIdCol = headers.indexOf("op_id");
+  const resultCol = headers.indexOf("result");
+  const lastRow = sheet.getLastRow();
+  if (opIdCol === -1 || resultCol === -1 || lastRow < 2) return null;
+
+  const values = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (String(values[i][opIdCol] || "") !== opId) continue;
+    const result = String(values[i][resultCol] || "");
+    if (result.indexOf("done:") !== 0) continue;
+    try {
+      const parsed = JSON.parse(result.slice("done:".length));
+      return Object.assign({}, parsed, { duplicate: true });
+    } catch (err) {
+      return null; // corrupt/truncated stored JSON — treat as "no match", just run it again
+    }
+  }
+  return null;
+}
+
+/**
+ * Calls Gemini for one `assist` request and returns the raw JSON text
+ * reply (NOT yet parsed — that's parseAssistResult_'s job, kept separate
+ * and pure so it can be unit-tested without a network call, same split as
+ * callGemini_/parseGeminiTasks_ above). Throws a short, readable error on
+ * any failure, which doAssistInternal_ treats exactly like a capture
+ * failure: fall back to one Inbox task.
+ */
+function callGeminiAssist_(raw, todayStr, contextTasks) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  if (!apiKey) throw new Error("missing_gemini_key");
+
+  const model = PropertiesService.getScriptProperties().getProperty("GEMINI_MODEL") || GEMINI_MODEL_DEFAULT;
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent";
+  const prompt = buildAssistPrompt_(raw, todayStr, contextTasks);
+
+  const requestBody = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: ASSIST_RESPONSE_SCHEMA,
+      temperature: 0.2,
+    },
+  };
+
+  const response = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    headers: { "x-goog-api-key": apiKey },
+    payload: JSON.stringify(requestBody),
+    muteHttpExceptions: true,
+  });
+
+  const status = response.getResponseCode();
+  if (status !== 200) {
+    throw new Error("gemini_http_" + status + ": " + response.getContentText().slice(0, 200));
+  }
+
+  let envelope;
+  try {
+    envelope = JSON.parse(response.getContentText());
+  } catch (err) {
+    throw new Error("gemini_bad_json_envelope");
+  }
+
+  const text = envelope && envelope.candidates && envelope.candidates[0] &&
+    envelope.candidates[0].content && envelope.candidates[0].content.parts &&
+    envelope.candidates[0].content.parts[0] && envelope.candidates[0].content.parts[0].text;
+  if (!text) throw new Error("gemini_no_text_in_response");
+
+  return text;
+}
+
+/**
+ * Applies one parsed, already-validated assist result to the sheet: new
+ * tasks (validateNewTask_, same as a plain capture) and ops (each mapped
+ * to an applyUpdate_ field bag by mapAssistOpToFields_, then written and
+ * calendar-synced exactly like a hand-edit) — all under ONE lock, so the
+ * response can never come back describing a change that only half-applied.
+ * An op whose id has since vanished (dropped, or from a stale context) is
+ * quietly skipped, never fails the whole request.
+ */
+function applyAssistWrites_(sheet, headers, assistResult, raw, nowIso, opId) {
+  // Every new task here already came out of parseAssistResult_ clean, so
+  // validateNewTask_ should never reject one — but if it somehow does
+  // (e.g. a title that ended up empty), drop just that one rather than
+  // failing the whole assist.
+  const newRows = assistResult.new_tasks.map(function (t) {
+    const validated = validateNewTask_(
+      Object.assign({}, t, { id: Utilities.getUuid(), status: "active", source: "ai", raw_input: raw }),
+      nowIso
+    );
+    return validated.ok ? validated.row : null;
+  }).filter(function (row) { return row !== null; });
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  let created = [];
+  const updated = [];
+  try {
+    created = appendTaskRows_(sheet, headers, newRows, opId);
+
+    if (assistResult.ops.length) {
+      const idIndex = buildIdIndex_(sheet, headers);
+      for (let i = 0; i < assistResult.ops.length; i++) {
+        const op = assistResult.ops[i];
+        const rowNum = idIndex[op.id];
+        if (!rowNum) continue; // unknown/stale id — skip, never fail the whole assist over one
+
+        const rowValues = sheet.getRange(rowNum, 1, 1, headers.length).getValues()[0];
+        const existingTask = rowToTask_(headers, rowValues);
+        const fields = mapAssistOpToFields_(op, existingTask);
+        if (!fields) continue; // e.g. a "schedule" with no date to schedule to
+
+        const result = applyUpdate_(existingTask, fields, nowIso);
+        if (!result.ok) continue;
+
+        sheet.getRange(rowNum, 1, 1, headers.length).setValues([taskToRowValues_(headers, result.task)]);
+        result.task.calendar_event_id = syncTaskEvent_(sheet, headers, rowNum, result.task);
+        updated.push(rowToTask_(headers, taskToRowValues_(headers, result.task)));
+      }
+    }
+  } finally {
+    lock.releaseLock();
+  }
+
+  return { ok: true, intent: assistResult.intent, reply: assistResult.reply, tasks: created, updated: updated, source: "ai" };
+}
+
+// --- Phase 8 `assist` — pure helpers ---------------------------------------
+// Like buildGeminiPrompt_/parseGeminiTasks_, these are kept free of any
+// Apps Script-only API so they can be copied into a plain .mjs file and run
+// under plain `node` — see the verification steps for this phase.
+
+/**
+ * PURE: picks which existing tasks to show Gemini for one `assist` call.
+ * Most days this is just "all of them" — the cap (ASSIST_MAX_CONTEXT_TASKS)
+ * only matters once the list is genuinely long, and even then it's better
+ * for Gemini to see the tasks a command is most likely to be about (open
+ * work, and anything with a real deadline) than to lose those to make room
+ * for old someday/done items.
+ */
+function selectAssistContextTasks_(tasks, max) {
+  if (tasks.length <= max) return tasks;
+  const priority = tasks.filter(function (t) { return t.status === "active" || t.status === "inbox" || t.due_date; });
+  const rest = tasks.filter(function (t) { return !(t.status === "active" || t.status === "inbox" || t.due_date); });
+  return priority.concat(rest).slice(0, max);
+}
+
+/** PURE: one compact line per task, in the exact shape buildAssistPrompt_
+ * tells Gemini to copy ids from VERBATIM. */
+function formatAssistContextLine_(t) {
+  const est = (t.est_min === "" || t.est_min === null || t.est_min === undefined) ? "" : String(t.est_min);
+  return [
+    t.id,
+    t.title,
+    t.status,
+    t.category,
+    est,
+    "do:" + (t.do_date || ""),
+    "due:" + (t.due_date || ""),
+    "touched:" + String(t.last_touched_at || "").slice(0, 10),
+  ].join(" | ");
+}
+
+/** PURE: joins formatAssistContextLine_ over a whole list, one per line. */
+function buildAssistContextText_(tasks) {
+  return tasks.map(formatAssistContextLine_).join("\n");
+}
+
+/**
+ * PURE: builds the single text prompt sent to Gemini for an `assist` call —
+ * today's date, the rules for splitting new tasks (mirrors
+ * buildGeminiPrompt_), and the extra rules for deciding when something is
+ * instead a change to an existing task or a question. Pure, so it's
+ * testable the same way buildGeminiPrompt_ is.
+ */
+function buildAssistPrompt_(raw, todayStr, contextTasks) {
+  const parts = String(todayStr).split("-").map(Number);
+  const weekdayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const weekday = weekdayNames[new Date(parts[0], parts[1] - 1, parts[2]).getDay()];
+
+  return (
+    "You are the one text box a person with ADHD uses for EVERYTHING in their task planner, " +
+    "typed or dictated. Today's date is " + todayStr + " (" + weekday + "), timezone Europe/London.\n\n" +
+    "Decide what they mean:\n" +
+    "- If they describe NEW things to do, put them in new_tasks: keep their own words for titles, " +
+    "short (≤80 chars), imperative; put extra detail in notes; estimate minutes realistically " +
+    "(5-120); resolve relative dates ('Friday', 'next week', 'tomorrow') to YYYY-MM-DD using today's " +
+    "date; due_date for deadlines, do_date only when they say when they'll DO it; leave blank when " +
+    "unsure; category from the list, Inbox if unclear.\n" +
+    "- If they refer to an EXISTING task (by rough title — match generously, e.g. 'the dentist' means " +
+    "'Book dentist check-up'), emit an op using the id copied EXACTLY, character for character, from " +
+    "the list below. NEVER invent an id or guess one that isn't in the list. If you can't tell which " +
+    "task they mean, ask in `reply` and emit no op for it.\n" +
+    "- For a question, answer in `reply` in at most 3 short, warm, plain sentences, using the task " +
+    "data below. Never mention how many things are undone, overdue or in the backlog unless they ask " +
+    "for a number directly.\n" +
+    "- For a command, `reply` is a short confirmation, e.g. \"Done — dentist moved to Friday.\" " +
+    "`reply` can be left blank for a plain capture with nothing else going on.\n\n" +
+    "intent is exactly one of: capture (only new things), command (only changes to existing tasks), " +
+    "question (only an answer, no changes), mixed (both new things and changes/an answer).\n\n" +
+    "Categories: " + CATEGORIES.join(", ") + "\n\n" +
+    "ops you can use: complete, uncomplete, drop, someday, restore, " +
+    "schedule (needs do_date), unschedule, set_due (needs due_date and/or due_time), clear_due, " +
+    "edit (any of title/notes/category/est_min).\n\n" +
+    "Existing tasks — one per line, exactly (id | title | status | category | est | do: | due: | touched:):\n" +
+    (contextTasks.length ? buildAssistContextText_(contextTasks) : "(none yet — everything is new_tasks)") + "\n\n" +
+    "What they just said:\n" + raw
+  );
+}
+
+/**
+ * PURE: turns Gemini's raw JSON text reply for an `assist` call into a
+ * clean, safe result. Same "structural failure throws, everything else is
+ * best-effort" split as parseGeminiTasks_/validateReview_ above: not-JSON
+ * or not-an-object throws (doAssistInternal_ treats that exactly like a
+ * Gemini outage and falls back to one Inbox task); everything else
+ * degrades gracefully — an unrecognised op name, or an id Gemini wasn't
+ * actually shown (not in `knownIds`), is just dropped from `ops`, never
+ * allowed to touch a task it was never shown or invent a change nobody
+ * asked for.
+ */
+function parseAssistResult_(jsonText, knownIds) {
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (err) {
+    throw new Error("assist_bad_json: " + (err && err.message ? err.message : String(err)));
+  }
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("assist_bad_shape");
+  }
+
+  const knownIdSet = knownIds instanceof Set ? knownIds : new Set(Array.isArray(knownIds) ? knownIds : []);
+
+  const intent = ASSIST_INTENTS.indexOf(parsed.intent) !== -1 ? parsed.intent : "capture";
+  const reply = String(parsed.reply || "").trim().slice(0, ASSIST_REPLY_MAX_CHARS);
+
+  const rawNewTasks = Array.isArray(parsed.new_tasks) ? parsed.new_tasks : [];
+  const newTasks = [];
+  for (let i = 0; i < rawNewTasks.length && newTasks.length < GEMINI_MAX_TASKS; i++) {
+    const t = rawNewTasks[i];
+    if (!t || typeof t !== "object") continue;
+    const title = String(t.title || "").trim().slice(0, 80);
+    if (!title) continue; // no usable title — not something we can call a task
+
+    newTasks.push({
+      title: title,
+      notes: t.notes ? String(t.notes) : "",
+      category: CATEGORIES.indexOf(t.category) !== -1 ? t.category : "Inbox",
+      est_min: clampEstMin_(t.est_min),
+      do_date: validDate_(t.do_date) ? t.do_date : "",
+      due_date: validDate_(t.due_date) ? t.due_date : "",
+      due_time: validTime_(t.due_time) ? t.due_time : "",
+    });
+  }
+
+  const rawOps = Array.isArray(parsed.ops) ? parsed.ops : [];
+  const ops = [];
+  for (let i = 0; i < rawOps.length && ops.length < ASSIST_MAX_OPS; i++) {
+    const o = rawOps[i];
+    if (!o || typeof o !== "object") continue;
+
+    const opName = ASSIST_OPS.indexOf(o.op) !== -1 ? o.op : "";
+    if (!opName) continue; // unrecognised op name — dropped, never guessed at
+
+    const id = String(o.id || "").trim();
+    if (!id || !knownIdSet.has(id)) continue; // no id, or one Gemini was never shown — dropped, never invented
+
+    const clean = { op: opName, id: id };
+    if (validDate_(o.do_date)) clean.do_date = o.do_date;
+    if (validDate_(o.due_date)) clean.due_date = o.due_date;
+    if (validTime_(o.due_time)) clean.due_time = o.due_time;
+    if (typeof o.title === "string" && o.title.trim()) clean.title = o.title.trim().slice(0, 300);
+    if (typeof o.notes === "string") clean.notes = o.notes;
+    if (CATEGORIES.indexOf(o.category) !== -1) clean.category = o.category;
+    if (o.est_min !== undefined) clean.est_min = clampEstMin_(o.est_min);
+
+    ops.push(clean);
+  }
+
+  return { intent: intent, reply: reply, new_tasks: newTasks, ops: ops };
+}
+
+/**
+ * PURE: maps one already-validated assist op onto the same whitelist-only
+ * field bag applyUpdate_ expects from a normal edit — this is what makes
+ * an op just an ordinary task update under the hood, with all of
+ * applyUpdate_'s own safety (bad dates ignored, empty title rejected) for
+ * free. Returns null for an op that, once you look at what it's actually
+ * asking for, has nothing sensible to do (e.g. "schedule" with no date) —
+ * the caller skips it rather than guessing.
+ */
+function mapAssistOpToFields_(op, existingTask) {
+  const o = op.op;
+  if (o === "complete") return { status: "done" };
+  if (o === "uncomplete") return { status: "active" };
+  if (o === "drop") return { status: "dropped" };
+  if (o === "someday") return { status: "someday" };
+  if (o === "restore") return { status: "active" };
+
+  if (o === "schedule") {
+    if (!op.do_date) return null; // nothing to schedule it TO
+    const fields = { do_date: op.do_date };
+    // A schedule command is also a decision that this thing is happening —
+    // bump it out of Inbox/Someday onto the active list, same as tapping
+    // "Today"/"Pick a day" on it by hand would (see app.js's
+    // withSortedStatus for the equivalent client-side rule).
+    if (existingTask && (existingTask.status === "inbox" || existingTask.status === "someday")) {
+      fields.status = "active";
+    }
+    return fields;
+  }
+
+  if (o === "unschedule") return { do_date: "" };
+
+  if (o === "set_due") {
+    if (!op.due_date && !op.due_time) return null; // nothing to set
+    const fields = {};
+    if (op.due_date !== undefined) fields.due_date = op.due_date;
+    if (op.due_time !== undefined) fields.due_time = op.due_time;
+    return fields;
+  }
+
+  if (o === "clear_due") return { due_date: "", due_time: "" };
+
+  if (o === "edit") {
+    const fields = {};
+    if (op.title !== undefined) fields.title = op.title;
+    if (op.notes !== undefined) fields.notes = op.notes;
+    if (op.category !== undefined) fields.category = op.category;
+    if (op.est_min !== undefined) fields.est_min = op.est_min;
+    return Object.keys(fields).length ? fields : null; // nothing to edit
+  }
+
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -2325,6 +2943,21 @@ function ensureTab_(ss, name, headers) {
     sheet = ss.insertSheet(name);
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
     sheet.setFrozenRows(1);
+    return sheet;
+  }
+
+  // The tab already exists — but a later version of this file can add a
+  // new column (e.g. Phase 8 adding `op_id` to the Log tab) that an
+  // existing sheet was created without. Rather than a separate one-off
+  // migration step, just append any header this version expects but the
+  // sheet doesn't have yet, as a new column at the end. Existing rows get
+  // a blank cell there (exactly as if that column had always existed and
+  // they'd simply never filled it in) — nothing is reordered or removed.
+  const lastCol = sheet.getLastColumn();
+  const existingHeaders = lastCol > 0 ? sheet.getRange(1, 1, 1, lastCol).getValues()[0] : [];
+  const missing = headers.filter(function (h) { return existingHeaders.indexOf(h) === -1; });
+  if (missing.length) {
+    sheet.getRange(1, existingHeaders.length + 1, 1, missing.length).setValues([missing]);
   }
   return sheet;
 }
@@ -2617,6 +3250,18 @@ function runTests() {
   test_validateReview_clampsWinsTo3_(results);
   test_validateReview_defaultsGeneratedBy_(results);
   test_validateReview_acceptsArrayOrSetForKnownIds_(results);
+
+  test_parseAssistResult_validMixedResult_(results);
+  test_parseAssistResult_dropsUnknownId_(results);
+  test_parseAssistResult_junkThrows_(results);
+  test_parseAssistResult_dropsInvalidOpName_(results);
+  test_parseAssistResult_defaultsBadIntent_(results);
+  test_parseAssistResult_capsOpsAtMax_(results);
+  test_mapAssistOpToFields_scheduleActivatesInboxTask_(results);
+  test_mapAssistOpToFields_scheduleWithoutDateIsSkipped_(results);
+  test_mapAssistOpToFields_unrecognisedOpReturnsNull_(results);
+  test_selectAssistContextTasks_prioritisesActiveAndDated_(results);
+  test_selectAssistContextTasks_returnsAllWhenUnderCap_(results);
 
   const failed = results.filter(function (r) { return !r.pass; });
   Logger.log(results.map(function (r) {
@@ -3217,4 +3862,129 @@ function test_validateReview_acceptsArrayOrSetForKnownIds_(results) {
   assert_(results, "validateReview_ works with knownIds passed as a plain array or as a Set",
     viaArray.ok === true && viaArray.review.suggested.length === 1 &&
     viaSet.ok === true && viaSet.review.suggested.length === 1);
+}
+
+// --- Phase 8: parseAssistResult_ --------------------------------------------
+
+function test_parseAssistResult_validMixedResult_(results) {
+  const knownIds = ["task-1", "task-2"];
+  const json = JSON.stringify({
+    intent: "mixed",
+    reply: "Done — dentist moved to Friday.",
+    new_tasks: [{ title: "Buy soap", category: "Shopping & Groceries" }],
+    ops: [{ op: "schedule", id: "task-1", do_date: "2026-09-25" }],
+  });
+  const result = parseAssistResult_(json, knownIds);
+  assert_(results, "parseAssistResult_ accepts a valid mixed result (new task + op + reply)",
+    result.intent === "mixed" &&
+    result.reply === "Done — dentist moved to Friday." &&
+    result.new_tasks.length === 1 && result.new_tasks[0].title === "Buy soap" &&
+    result.ops.length === 1 && result.ops[0].op === "schedule" &&
+    result.ops[0].id === "task-1" && result.ops[0].do_date === "2026-09-25");
+}
+
+function test_parseAssistResult_dropsUnknownId_(results) {
+  const json = JSON.stringify({
+    intent: "command",
+    reply: "",
+    new_tasks: [],
+    ops: [
+      { op: "complete", id: "known-1" },
+      { op: "complete", id: "never-shown-to-gemini" },
+    ],
+  });
+  const result = parseAssistResult_(json, ["known-1"]);
+  assert_(results, "parseAssistResult_ drops an op whose id was never shown to Gemini, keeps a known one",
+    result.ops.length === 1 && result.ops[0].id === "known-1");
+}
+
+function test_parseAssistResult_junkThrows_(results) {
+  let threw = false;
+  try {
+    parseAssistResult_("not json at all", ["task-1"]);
+  } catch (err) {
+    threw = true;
+  }
+  assert_(results, "parseAssistResult_ throws on text that isn't parsable JSON", threw === true);
+
+  let threwOnArray = false;
+  try {
+    parseAssistResult_("[1, 2, 3]", ["task-1"]);
+  } catch (err) {
+    threwOnArray = true;
+  }
+  assert_(results, "parseAssistResult_ throws on valid JSON that isn't an object", threwOnArray === true);
+}
+
+function test_parseAssistResult_dropsInvalidOpName_(results) {
+  const json = JSON.stringify({
+    intent: "command",
+    reply: "",
+    new_tasks: [],
+    ops: [{ op: "delete_forever", id: "task-1" }],
+  });
+  const result = parseAssistResult_(json, ["task-1"]);
+  assert_(results, "parseAssistResult_ drops an op with an unrecognised op name",
+    result.ops.length === 0);
+}
+
+function test_parseAssistResult_defaultsBadIntent_(results) {
+  const json = JSON.stringify({ intent: "sing_a_song", reply: "", new_tasks: [], ops: [] });
+  const result = parseAssistResult_(json, []);
+  assert_(results, "parseAssistResult_ defaults an unrecognised intent to capture",
+    result.intent === "capture");
+}
+
+function test_parseAssistResult_capsOpsAtMax_(results) {
+  const knownIds = [];
+  const ops = [];
+  for (let i = 0; i < ASSIST_MAX_OPS + 5; i++) {
+    knownIds.push("id-" + i);
+    ops.push({ op: "complete", id: "id-" + i });
+  }
+  const json = JSON.stringify({ intent: "command", reply: "", new_tasks: [], ops: ops });
+  const result = parseAssistResult_(json, knownIds);
+  assert_(results, "parseAssistResult_ never returns more than ASSIST_MAX_OPS ops",
+    result.ops.length === ASSIST_MAX_OPS);
+}
+
+// --- Phase 8: mapAssistOpToFields_ ------------------------------------------
+
+function test_mapAssistOpToFields_scheduleActivatesInboxTask_(results) {
+  const fields = mapAssistOpToFields_({ op: "schedule", do_date: "2026-09-25" }, { status: "inbox" });
+  assert_(results, "mapAssistOpToFields_ schedule sets do_date and bumps an inbox task to active",
+    fields && fields.do_date === "2026-09-25" && fields.status === "active");
+}
+
+function test_mapAssistOpToFields_scheduleWithoutDateIsSkipped_(results) {
+  const fields = mapAssistOpToFields_({ op: "schedule" }, { status: "active" });
+  assert_(results, "mapAssistOpToFields_ drops a schedule op with no date to schedule to",
+    fields === null);
+}
+
+function test_mapAssistOpToFields_unrecognisedOpReturnsNull_(results) {
+  const fields = mapAssistOpToFields_({ op: "teleport" }, { status: "active" });
+  assert_(results, "mapAssistOpToFields_ returns null for an op name it doesn't recognise",
+    fields === null);
+}
+
+// --- Phase 8: selectAssistContextTasks_ -------------------------------------
+
+function test_selectAssistContextTasks_prioritisesActiveAndDated_(results) {
+  const tasks = [
+    { id: "1", status: "someday" },
+    { id: "2", status: "active" },
+    { id: "3", status: "done", due_date: "2026-09-25" },
+  ];
+  const picked = selectAssistContextTasks_(tasks, 2);
+  const ids = picked.map(function (t) { return t.id; });
+  assert_(results, "selectAssistContextTasks_ keeps active/inbox/due-dated tasks over others when trimming",
+    picked.length === 2 && ids.indexOf("1") === -1);
+}
+
+function test_selectAssistContextTasks_returnsAllWhenUnderCap_(results) {
+  const tasks = [{ id: "1", status: "active" }, { id: "2", status: "someday" }];
+  const picked = selectAssistContextTasks_(tasks, 10);
+  assert_(results, "selectAssistContextTasks_ returns every task unchanged when there's room for all of them",
+    picked.length === 2);
 }

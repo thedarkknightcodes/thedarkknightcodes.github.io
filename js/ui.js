@@ -45,6 +45,8 @@ export function init(handlers) {
   refs.captureInput = el("capture-input");
   refs.todayToggle = el("today-toggle");
   refs.captureFeedback = el("capture-feedback");
+  refs.captureHint = el("capture-hint");
+  refs.replyCard = el("reply-card");
   refs.pendingCaptures = el("pending-captures");
   refs.inboxLink = el("inbox-link");
 
@@ -301,9 +303,13 @@ export function renderToday(vm, handlers) {
   renderPickThree(vm.pickThree, handlers);
 }
 
-/** The subtle "Sorting…" (or "Waiting for signal…") hint that lives right
- * on the capture box, so it's obvious a ramble is still being worked on
- * without needing to look away from where you just typed. */
+/** The subtle "Thinking…" / "Sorting…" (or "Waiting for signal…") hint that
+ * lives right on the capture box, so it's obvious something typed/dictated
+ * is still being worked on without needing to look away from where you
+ * just typed. "Thinking…" covers Phase 8's `assist` (it might be sorting a
+ * brain-dump, applying a command, or answering a question — "Thinking…" is
+ * the one word that's honest about all three); "Sorting…" is only ever a
+ * plain `capture` now (the share-target path — see app.js's handleCapture). */
 function renderCaptureFeedback(pendingCaptures) {
   if (!refs.captureFeedback) return;
   if (!pendingCaptures.length) {
@@ -311,13 +317,18 @@ function renderCaptureFeedback(pendingCaptures) {
     return;
   }
   const waiting = pendingCaptures.some(function (p) { return p.waiting; });
-  refs.captureFeedback.textContent = waiting ? "Waiting for signal…" : "Sorting…";
+  if (waiting) {
+    refs.captureFeedback.textContent = "Waiting for signal…";
+    return;
+  }
+  const thinking = pendingCaptures.some(function (p) { return p.thinking; });
+  refs.captureFeedback.textContent = thinking ? "Thinking…" : "Sorting…";
 }
 
-/** One row per capture still being sorted, at the top of Today. These come
- * straight from the outgoing queue (see app.js's buildPendingCaptures), so
- * a reload never loses one — it just keeps showing until the real response
- * comes back (or, offline, until there's a signal to send it on). */
+/** One row per capture/assist still in flight, at the top of Today. These
+ * come straight from the outgoing queue (see app.js's buildPendingCaptures),
+ * so a reload never loses one — it just keeps showing until the real
+ * response comes back (or, offline, until there's a signal to send it on). */
 function renderPendingCaptures(pendingCaptures) {
   if (!refs.pendingCaptures) return;
   clearChildren(refs.pendingCaptures);
@@ -329,10 +340,116 @@ function renderPendingCaptures(pendingCaptures) {
     dot.setAttribute("aria-hidden", "true");
     row.appendChild(dot);
     const text = document.createElement("span");
-    text.textContent = item.waiting ? "Waiting for signal…" : "Sorting: " + item.preview + "…";
+    text.textContent = item.waiting
+      ? "Waiting for signal…"
+      : (item.thinking ? "Thinking: " : "Sorting: ") + item.preview + "…";
     row.appendChild(text);
     refs.pendingCaptures.appendChild(row);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Reply card (Phase 8) — the answer to a command or question typed/dictated
+// into the capture box. Imperative, like the toast (see showToast below):
+// app.js calls showReplyCard once when an `assist` response lands, rather
+// than this being part of the declarative renderToday() view model — it
+// isn't store state, it's a one-off reaction to a single server reply.
+// ---------------------------------------------------------------------------
+
+let replyDismissTimer = null;
+let replyKeydownCleanup = null;
+
+/**
+ * Shows the reply card under the capture box. `opts`:
+ *   - `isQuestion` — true keeps the card up until dismissed by hand
+ *     (Escape or the ×); false (an ordinary command confirmation)
+ *     auto-dismisses after 20s, the same "you don't have to do anything"
+ *     feel as the undo toast.
+ *   - `onUndo` — if given, an "Undo" button reverses the change (used for
+ *     a command that actually changed something; a question has none).
+ *   - `focusBox` — true (Gemini asked a clarifying question and made no
+ *     change) sends focus back to the capture box so the next thing typed
+ *     is naturally the answer.
+ */
+export function showReplyCard(reply, opts) {
+  hideReplyCard();
+  if (!refs.replyCard || !reply) return;
+  opts = opts || {};
+
+  const container = refs.replyCard;
+  container.hidden = false;
+
+  const text = document.createElement("p");
+  text.className = "card-copy reply-card-text";
+  text.textContent = reply;
+  container.appendChild(text);
+
+  if (opts.onUndo) {
+    const actions = document.createElement("div");
+    actions.className = "card-actions";
+    const undoBtn = document.createElement("button");
+    undoBtn.type = "button";
+    undoBtn.className = "btn btn-quiet";
+    undoBtn.textContent = "Undo";
+    undoBtn.addEventListener("click", function () {
+      opts.onUndo();
+      hideReplyCard();
+    });
+    actions.appendChild(undoBtn);
+    container.appendChild(actions);
+  }
+
+  const closeBtn = document.createElement("button");
+  closeBtn.type = "button";
+  closeBtn.className = "reply-card-close";
+  closeBtn.setAttribute("aria-label", "Dismiss");
+  closeBtn.textContent = "×";
+  closeBtn.addEventListener("click", hideReplyCard);
+  container.appendChild(closeBtn);
+
+  function onKeydown(e) {
+    if (e.key === "Escape") hideReplyCard();
+  }
+  document.addEventListener("keydown", onKeydown);
+  replyKeydownCleanup = function () { document.removeEventListener("keydown", onKeydown); };
+
+  if (!opts.isQuestion) {
+    replyDismissTimer = setTimeout(hideReplyCard, 20000);
+  }
+
+  if (opts.focusBox && refs.captureInput) {
+    refs.captureInput.focus();
+  }
+}
+
+function hideReplyCard() {
+  clearTimeout(replyDismissTimer);
+  replyDismissTimer = null;
+  if (replyKeydownCleanup) {
+    replyKeydownCleanup();
+    replyKeydownCleanup = null;
+  }
+  if (!refs.replyCard) return;
+  clearChildren(refs.replyCard);
+  refs.replyCard.hidden = true;
+}
+
+// ---------------------------------------------------------------------------
+// First-run capture hint (Phase 8) — shown under the box until the first
+// `assist` call succeeds (see app.js's markAssistHintSeen). Plain show/hide,
+// no view model: like the reply card, this isn't store state.
+// ---------------------------------------------------------------------------
+
+export function showCaptureHint(text) {
+  if (!refs.captureHint) return;
+  refs.captureHint.textContent = text;
+  refs.captureHint.hidden = false;
+}
+
+export function hideCaptureHint() {
+  if (!refs.captureHint) return;
+  refs.captureHint.hidden = true;
+  refs.captureHint.textContent = "";
 }
 
 /** The quiet "n new things to sort" link — deliberately not styled as a

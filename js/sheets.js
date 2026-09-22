@@ -238,6 +238,15 @@ export function openSettingsSheet(info, handlers) {
   remindersLine.textContent = "Reminders: events go into your \"Tasks\" Google Calendar";
   dialog.appendChild(remindersLine);
 
+  // Phase 8: a standing reminder that the box does more than sort
+  // brain-dumps now — the first-run hint under the box (see ui.js's
+  // showCaptureHint) says this too, but only until it's dismissed itself
+  // by a first successful assist; this one just always lives here.
+  const assistTipLine = document.createElement("p");
+  assistTipLine.className = "settings-line";
+  assistTipLine.textContent = "Tip: the box understands commands and questions too — try \"what's due this week?\"";
+  dialog.appendChild(assistTipLine);
+
   const actions = document.createElement("div");
   actions.className = "sheet-actions";
   // Only shown once Android/Chrome has told us the app is installable

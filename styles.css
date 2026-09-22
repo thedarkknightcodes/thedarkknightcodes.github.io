@@ -338,6 +338,37 @@ p { margin: 0 0 8px; }
   min-height: 1em;
 }
 
+/* Phase 8: the first-run "the box understands commands too" hint. Same
+   quiet, muted treatment as capture-feedback — a tip, not an alert. */
+.capture-hint {
+  margin: 8px 4px 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+/* ---------------------------------------------------------------------
+   Reply card (Phase 8) — the answer to a command or question typed/
+   dictated into the capture box. Reuses .card's shape; a small × lets it
+   be dismissed without waiting the full 20s a confirmation gets.
+   --------------------------------------------------------------------- */
+
+.reply-card { position: relative; padding-right: 40px; }
+.reply-card-text { margin-bottom: 8px; }
+.reply-card-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
 /* ---------------------------------------------------------------------
    Pending captures (rows at the top of Today while the AI is sorting)
    --------------------------------------------------------------------- */
