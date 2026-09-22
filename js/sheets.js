@@ -203,6 +203,14 @@ export function openSettingsSheet(info, handlers) {
   heading.textContent = "Settings";
   dialog.appendChild(heading);
 
+  // App version is the code running in THIS tab right now (from sw.js's
+  // CACHE_VERSION) — separate from "Backend" below, which is whatever
+  // version the Apps Script server last reported over the network.
+  const appVersionLine = document.createElement("p");
+  appVersionLine.className = "settings-line";
+  appVersionLine.textContent = "App version: " + (info.appVersion || "unknown");
+  dialog.appendChild(appVersionLine);
+
   const versionLine = document.createElement("p");
   versionLine.className = "settings-line";
   const timeLine = document.createElement("p");
@@ -214,9 +222,23 @@ export function openSettingsSheet(info, handlers) {
 
   const actions = document.createElement("div");
   actions.className = "sheet-actions";
+  // Only shown once Android/Chrome has told us the app is installable
+  // (captured earlier as the "beforeinstallprompt" event) — there's no
+  // point offering a button that can't do anything yet.
+  if (info.canInstall) addSheetButton(actions, "Install app", handlers.onInstall);
   addSheetButton(actions, "Refresh", handlers.onRefresh);
   addSheetButton(actions, "Forget key on this device", handlers.onForgetKey, "sheet-btn-quiet");
   dialog.appendChild(actions);
+
+  // iOS has no install button at all — Safari only offers "Add to Home
+  // Screen" from its own Share sheet, so the best the app can do is tell
+  // you where to find it.
+  if (info.showIosInstallHint) {
+    const iosHint = document.createElement("p");
+    iosHint.className = "settings-line";
+    iosHint.textContent = "To install: Share → Add to Home Screen.";
+    dialog.appendChild(iosHint);
+  }
 
   const closeBtn = document.createElement("button");
   closeBtn.type = "button";

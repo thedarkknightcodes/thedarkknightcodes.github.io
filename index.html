@@ -12,6 +12,20 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src https://script.google.com https://script.googleusercontent.com; base-uri 'none'; form-action 'none'">
 <title>Task Planner</title>
 <link rel="stylesheet" href="styles.css">
+<!--
+  PWA bits: the manifest is what lets a browser offer "Install app", and
+  theme-color tints the browser's own address bar / status bar to match
+  the app instead of staying a generic system colour. Two theme-color
+  tags, one per light/dark, so it follows the same switch styles.css uses.
+-->
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#3d6b5c" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#7fb8a3" media="(prefers-color-scheme: dark)">
+<!-- iOS ignores the manifest for its home-screen icon and install prompt,
+     so it needs these two tags spelled out separately. -->
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 </head>
 <body>
 <div id="app" class="app">

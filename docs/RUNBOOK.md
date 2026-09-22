@@ -187,3 +187,39 @@ a backup.
 
 Running `migrate` a second time does nothing (it refuses if Tasks2 already
 has rows), so it's safe if you click it twice by mistake.
+
+---
+
+## H. Install on your devices
+
+As of Phase 3 the app can be installed like a normal app, instead of
+staying a browser tab. See `docs/02-what-we-built-pwa.md` for what that
+means and why.
+
+**Pixel (Android, Chrome):**
+
+1. Open `https://thedarkknightcodes.github.io/` in Chrome.
+2. Tap the **⋮** menu (top right) → **Install app** (or **Add to Home
+   screen** on older Chrome versions). You may instead see a banner
+   offering this automatically — either way works.
+3. Confirm. The icon appears on your home screen and opens in its own
+   window, no address bar.
+
+**iPad (Safari):**
+
+1. Open `https://thedarkknightcodes.github.io/` in Safari (it must be
+   Safari — Chrome/Firefox on iOS can't do this).
+2. Tap the **Share** icon (square with an arrow, in the toolbar).
+3. Scroll down and tap **Add to Home Screen** → **Add**.
+
+**After a code push:** the app checks for a new version over the network
+each time you open it, and falls back to the last saved copy only when
+there's no signal. If you've pushed a change and the installed app still
+looks old, **close it fully and reopen it once** — that's normally enough
+to pick up the update. A small "Update ready — tap to reload" message
+appears if a new version was already downloading in the background.
+
+**If you change the manifest or icons specifically:** an already-installed
+copy won't notice on its own — you need to remove it from the home screen
+and add it again. This doesn't apply to ordinary code changes, only to
+`manifest.webmanifest` or the files in `icons/`.

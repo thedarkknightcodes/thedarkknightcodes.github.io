@@ -11,9 +11,15 @@ security and reliability problems (see `docs/00-what-we-built-security.md`
 for the first one fixed). It's being replaced a phase at a time, with each
 phase actually used for a while before the next one starts.
 
-## Current status: Phase 2 — touch-first UI
+## Current status: Phase 3 — minimal PWA
 
-Phase 2 replaces the old drag-and-drop, weekday-based screen with a
+Phase 3 makes the app installable: a manifest and icons so "Install app" /
+"Add to Home Screen" works on Pixel and iPad, plus a service worker that
+caches the app shell (the screen itself, not your tasks) so it still opens
+with no signal. See `docs/02-what-we-built-pwa.md` for what changed and
+why, and `docs/RUNBOOK.md` section H for install steps per device.
+
+Phase 2 replaced the old drag-and-drop, weekday-based screen with a
 touch-first app: a Today view (capture box + a handful of tasks + "Pick 3
 for me"), a Week view, and a Someday list — all built with real dates, an
 offline-safe save queue, and no build step. See
@@ -35,16 +41,22 @@ this repo, with the person driving the rebuild).
 | `js/api.js` | Talks to the server (`api()`, lifted from spike.js) plus a `?mock=1` in-memory fake backend. |
 | `js/store.js` | App state, the localStorage task cache, and the outgoing-changes queue. |
 | `js/logic.js` | Pure functions only — capture parsing, "Pick 3", date helpers, grouping. No DOM, so it's fully unit-tested. |
-| `js/ui.js` | All DOM rendering: task rows, the action sheet, the edit form, the undo toast. |
+| `js/ui.js` | All DOM rendering: task rows, the undo toast, the key/main screens. |
 | `js/app.js` | Wires the above together: what happens when you tap something. |
+| `js/sheets.js` | The action sheet, edit form and settings sheet (the three popups). |
 | `test/logic.test.mjs` | Runs with plain `node test/logic.test.mjs` — no install needed. |
 | `spike.html` / `spike.js` | Phase 0 connection-test page: save a device key, Ping the server, List tasks. Kept for reference. |
 | `config.js` | Public config — the Apps Script URL(s). Safe to commit (see comment in the file for why). |
+| `manifest.webmanifest` | PWA manifest: name, icons, colours, install behaviour, share target. |
+| `sw.js` | Service worker: caches the app shell so it works offline; bump `CACHE_VERSION` per release. |
+| `icons/` | App icons (192/512/maskable/Apple touch), built by `tools/make-icons.mjs`. |
+| `tools/make-icons.mjs` | Generates the icon PNGs from scratch, no dependencies — run with `node tools/make-icons.mjs`. |
 | `apps-script/Code.gs` | The Google Apps Script backend (paste into the Apps Script editor). |
 | `apps-script/appsscript.json` | The Apps Script project manifest (timezone, web app settings). |
-| `docs/RUNBOOK.md` | Exact click-by-click steps: setup, deploying changes, rotating the device key, testing. |
+| `docs/RUNBOOK.md` | Exact click-by-click steps: setup, deploying changes, rotating the device key, testing, installing on devices. |
 | `docs/00-what-we-built-security.md` | Plain-English explanation of what Phase 0 fixed and why. |
 | `docs/01-what-we-built-data-and-ui.md` | Plain-English explanation of what Phase 2 built and why. |
+| `docs/02-what-we-built-pwa.md` | Plain-English explanation of what Phase 3 built and why. |
 
 ## Getting started
 

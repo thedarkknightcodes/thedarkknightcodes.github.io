@@ -21,6 +21,13 @@ import * as ui from "./ui.js";
 
 const RETRY_DELAYS_MS = [2000, 5000, 15000, 60000];
 
+// Shown in Settings so you can tell at a glance whether a device has
+// picked up the latest app shell yet. Keep this in sync by hand with
+// CACHE_VERSION in sw.js whenever you bump one — they're two separate
+// files (this one runs on the page, that one runs in the background) so
+// there's no automatic way to share a single constant between them.
+const APP_VERSION = "planner-v1";
+
 let currentTab = "today";
 let doneTodayOpen = false;
 let unscheduledFilterValue = "";
@@ -28,6 +35,7 @@ let pickThreeDismissed = false;
 let flushing = false;
 let retryAttempt = 0;
 let retryTimer = null;
+let deferredInstallPrompt = null; // captured "beforeinstallprompt" event, Android/Chrome only
 
 // Read once at startup, before we overwrite it with today's date — this is
 // what lets Pick 3 tell "opened yesterday" from "haven't opened in a week".
@@ -133,6 +141,11 @@ function handleCapture(raw, todayOn) {
     store.enqueueOp({ op_id: task.id, action: "add", payload: { task: task, op_id: task.id } });
   }
   flushQueue();
+  // This confirms the capture landed *locally* — it always fires, online or
+  // off, because step 1 (save it locally) already happened above. The sync
+  // dot is what tells you whether it's reached the server yet; nothing
+  // here should look alarming just because you're offline for a bit.
+  ui.showToast("Got it ✓");
 }
 
 function handleToggleDone(task) {
@@ -248,7 +261,14 @@ function render() {
 // ---------------------------------------------------------------------------
 
 async function openSettings() {
-  const info = { version: "…", time: "", mode: api.isMockMode() ? "mock (?mock=1)" : "live" };
+  const info = {
+    version: "…",
+    time: "",
+    mode: api.isMockMode() ? "mock (?mock=1)" : "live",
+    appVersion: APP_VERSION,
+    canInstall: !!deferredInstallPrompt,
+    showIosInstallHint: isIosNotInstalled(),
+  };
   ui.openSettingsSheet(info, {
     onRefresh: function () {
       refreshTasks();
@@ -258,6 +278,13 @@ async function openSettings() {
       api.forgetDeviceKey();
       ui.closeSettings();
       ui.showKeyScreen("");
+    },
+    onInstall: function () {
+      if (!deferredInstallPrompt) return;
+      deferredInstallPrompt.prompt();
+      // A device only lets a given prompt be used once — clear it either
+      // way so we don't try to reuse a spent one.
+      deferredInstallPrompt.userChoice.finally(function () { deferredInstallPrompt = null; });
     },
   });
   pingForSettings();
@@ -286,10 +313,75 @@ const topHandlers = {
 };
 
 // ---------------------------------------------------------------------------
+// PWA bits: install-to-home-screen, the service worker, and the "opened
+// from the installed app" URL param
+// ---------------------------------------------------------------------------
+
+/** True on an iPhone/iPad's Safari that hasn't been added to the home
+ * screen yet — the signal for showing the "Share → Add to Home Screen"
+ * hint, since iOS has no `beforeinstallprompt` event to hook into. */
+function isIosNotInstalled() {
+  const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent);
+  return isIos && navigator.standalone === false;
+}
+
+/** Chrome/Android fires this once, early, if the app is installable —
+ * capture it so a later tap of "Install app" in Settings can replay it
+ * (the browser's own install banner can only be triggered from a real
+ * user gesture, not from code running on page load). */
+function wireInstallPrompt() {
+  window.addEventListener("beforeinstallprompt", function (e) {
+    e.preventDefault();
+    deferredInstallPrompt = e;
+  });
+}
+
+/** `manifest.webmanifest`'s start_url is `/?source=pwa`, purely so we can
+ * tell "opened from the installed icon" apart from "opened in a normal
+ * browser tab" if that's ever useful. Nothing in the app currently reads
+ * it, so strip it from the visible URL right away rather than leave a
+ * confusing query string sitting in the address bar. */
+function stripPwaSourceParam() {
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has("source")) return;
+  url.searchParams.delete("source");
+  window.history.replaceState({}, "", url.pathname + (url.search || "") + url.hash);
+}
+
+/** Registers the service worker that makes the app shell available
+ * offline (see sw.js). Harmless to call in `?mock=1` mode too — it just
+ * caches the same static files either way. */
+function registerServiceWorker() {
+  if (!("serviceWorker" in navigator)) return;
+  navigator.serviceWorker.register("/sw.js").then(function (registration) {
+    registration.addEventListener("updatefound", function () {
+      const newWorker = registration.installing;
+      if (!newWorker) return;
+      newWorker.addEventListener("statechange", function () {
+        // "installed" + an existing controller means this ISN'T the very
+        // first install — it's a newer version sitting ready in the
+        // background while the old one still runs this open tab. That's
+        // exactly the moment to offer a reload, and only that moment.
+        if (newWorker.state === "installed" && navigator.serviceWorker.controller) {
+          ui.showToast("Update ready — tap to reload", "Reload", function () { window.location.reload(); });
+        }
+      });
+    });
+  }).catch(function () {
+    // No service worker this session (unsupported browser, blocked, etc.)
+    // — the app still works fully online, it just won't work offline.
+  });
+}
+
+// ---------------------------------------------------------------------------
 // startup
 // ---------------------------------------------------------------------------
 
 async function init() {
+  stripPwaSourceParam();
+  wireInstallPrompt();
+  registerServiceWorker();
+
   ui.init(topHandlers);
   store.subscribe(render);
 
