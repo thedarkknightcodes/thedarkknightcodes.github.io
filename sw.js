@@ -8,7 +8,7 @@
  * icons) — that's what makes the old cache get thrown away in `activate`
  * below, instead of the app quietly showing stale code forever.
  */
-const CACHE_VERSION = "planner-v4";
+const CACHE_VERSION = "planner-v5";
 const CACHE_NAME = "task-planner-" + CACHE_VERSION;
 
 // Everything needed to draw the screen and run the app offline. Your

@@ -866,6 +866,13 @@ function parseDateOnly_(dateStr) {
   return new Date(parts[0], parts[1] - 1, parts[2]);
 }
 
+/** YYYY-MM-DD plus N days, as YYYY-MM-DD (in the script's timezone). */
+function addDaysString_(dateStr, days) {
+  const d = parseDateOnly_(dateStr);
+  d.setDate(d.getDate() + days);
+  return Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd");
+}
+
 function parseDateTime_(dateStr, timeStr) {
   const dateParts = String(dateStr).split("-").map(Number);
   const timeParts = String(timeStr).split(":").map(Number);
@@ -1100,16 +1107,23 @@ function buildDigestEvent_() {
       ? []
       : rowsToTasks_(headers, sheet.getRange(2, 1, lastRow - 1, headers.length).getValues());
 
-    const today = todayString_();
-    const text = buildDigestText_(tasks, today);
+    // The nightly trigger runs around 03:00, so "today 07:30" is still
+    // ahead. But if this is run by hand later in the day, a 07:30 event
+    // would already be in the past — so aim at tomorrow morning instead.
+    let target = todayString_();
+    if (new Date() > parseDateTime_(target, "07:40")) {
+      target = addDaysString_(target, 1);
+    }
+    const text = buildDigestText_(tasks, target);
 
-    const start = parseDateTime_(today, "07:30");
-    const end = parseDateTime_(today, "07:40");
+    const start = parseDateTime_(target, "07:30");
+    const end = parseDateTime_(target, "07:40");
     const event = cal.createEvent(text.title, start, end, { description: text.description });
     event.removeAllReminders();
     event.addPopupReminder(0);
 
     props.setProperty("DIGEST_EVENT_ID", event.getId());
+    Logger.log("Digest event created for " + target + " 07:30 in the Tasks calendar: \"" + text.title + "\"");
   } catch (err) {
     Logger.log("buildDigestEvent_ failed: " + errorMessage_(err));
   }

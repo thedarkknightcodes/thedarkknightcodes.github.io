@@ -16,6 +16,7 @@
  */
 
 export { openActionSheet, openSettingsSheet, updateSettingsInfo, closeSettings } from "./sheets.js";
+import { renderReview } from "./review.js";
 
 const refs = {};
 let toastTimer = null;
@@ -270,6 +271,11 @@ function attachSwipe(el, onDone) {
 
 export function renderToday(vm, handlers) {
   refs.migrationNotice.hidden = !vm.needsMigration;
+
+  // The review card (Phase 7) always renders first, above everything else
+  // on Today — see buildTodayViewModel's comment for why it and Pick 3
+  // never both show at once.
+  renderReview(vm.review, { onApply: handlers.onReviewApply, onDismiss: handlers.onReviewDismiss });
 
   renderCaptureFeedback(vm.pendingCaptures);
   renderPendingCaptures(vm.pendingCaptures);

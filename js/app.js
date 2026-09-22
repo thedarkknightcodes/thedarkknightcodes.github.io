@@ -85,6 +85,7 @@ async function flushQueue() {
       try {
         const result = await api.api(op.action, op.payload);
         if (op.action === "capture") applyCaptureResult(op, result.data);
+        if (op.action === "review_apply") applyReviewApplyResult(result.data);
         store.dequeueOp(op.op_id);
         retryAttempt = 0;
       } catch (err) {
@@ -131,6 +132,22 @@ async function refreshTasks() {
     }
     // A network hiccup on a background refresh just leaves the cached
     // tasks on screen — no need to alarm anyone over it.
+  }
+}
+
+/**
+ * Phase 7: fetch this week's review, if there is one. Fire-and-forget on
+ * purpose (see init()'s comment) — a review is a nice-to-have on top of
+ * the task list, never something worth delaying the app's own startup
+ * for, or worth putting up an error over if it fails.
+ */
+async function fetchReview() {
+  try {
+    const result = await api.api("review_get", {});
+    store.setReview(result.data.review || null);
+  } catch (err) {
+    // No review shows this session. refreshTasks()'s own key-screen /
+    // retry handling already covers anything worth surfacing.
   }
 }
 
@@ -240,6 +257,53 @@ function highlightTaskIds(ids) {
   }, 1600);
 }
 
+/**
+ * Runs once a `review_apply` op's server response comes back — merges
+ * whichever tasks it actually changed into the store, the same way
+ * applyCaptureResult does for a capture's new tasks. The review card
+ * itself already disappeared the moment "Apply ticked" was pressed (see
+ * applyReview below), so this is purely about the task list catching up.
+ */
+function applyReviewApplyResult(data) {
+  const tasks = (data && data.tasks) || [];
+  for (const task of tasks) store.upsertTask(task);
+}
+
+/**
+ * "Apply ticked" on the review card. `accept` is `{ suggested: [ids],
+ * someday: [ids], drop: [ids] }` — just whichever checkboxes ended up
+ * ticked (see review.js). Same optimistic-queue shape as every other
+ * mutation in this file: the card disappears and the toast fires right
+ * away, the actual server call is queued (so it survives a reload and
+ * retries itself if you're offline), and applyReviewApplyResult above
+ * folds in whatever it changed once that call lands.
+ */
+function applyReview(accept) {
+  const review = store.getState().review;
+  if (!review) return;
+  const weekStart = review.week_start;
+  const opId = logic.randomId();
+
+  store.setReview(null);
+  store.enqueueOp({ op_id: opId, action: "review_apply", payload: { week_start: weekStart, accept: accept, op_id: opId } });
+  flushQueue();
+
+  ui.showToast("Week set up ✓");
+}
+
+/** "Not now" on the review card, or pressing Escape while it's showing —
+ * the review just goes away; nothing about any task changes. */
+function dismissReview() {
+  const review = store.getState().review;
+  if (!review) return;
+  const weekStart = review.week_start;
+  const opId = logic.randomId();
+
+  store.setReview(null);
+  store.enqueueOp({ op_id: opId, action: "review_dismiss", payload: { week_start: weekStart, op_id: opId } });
+  flushQueue();
+}
+
 function handleToggleDone(task) {
   const wasDone = task.status === "done";
   const fields = wasDone
@@ -265,12 +329,48 @@ function buildPendingCaptures(state) {
     });
 }
 
+/**
+ * Turns state.review (raw ids + reasons, as the server stores it) into
+ * what review.js needs to draw: real task titles looked up from
+ * state.tasks, with any id that isn't found (or ever was, e.g. dropped
+ * since the review was written) quietly skipped rather than shown broken.
+ */
+function buildReviewViewModel(state) {
+  const review = state.review;
+  if (!review) return null;
+
+  const taskById = new Map(state.tasks.map(function (t) { return [t.id, t]; }));
+  function withTitles(list) {
+    return (list || [])
+      .map(function (item) {
+        const task = taskById.get(item.id);
+        return task ? { id: item.id, title: task.title, reason: item.reason || "" } : null;
+      })
+      .filter(function (item) { return item !== null; });
+  }
+
+  return {
+    week_start: review.week_start,
+    source: review.source,
+    summary: review.summary || "",
+    wins: review.wins || [],
+    suggested: withTitles(review.suggested),
+    someday: withTitles(review.someday),
+    drop: withTitles(review.drop),
+  };
+}
+
 function buildTodayViewModel(state) {
   const today = state.serverToday;
   const split = logic.splitTodayTasks(state.tasks, today);
   const activeAll = state.tasks.filter(function (t) { return t.status === "active"; });
 
-  const showPick = !pickThreeDismissed && logic.shouldShowPickThree({
+  // Phase 7: a review is the more useful thing to show if both would
+  // otherwise appear at once — it already tells you what to do this week,
+  // so a separate "Pick 3" card right underneath it would just be noise.
+  const reviewVm = buildReviewViewModel(state);
+
+  const showPick = !reviewVm && !pickThreeDismissed && logic.shouldShowPickThree({
     todayTaskCount: split.scheduled.length + split.dueToday.length,
     lastOpenStr: initialLastOpen,
     today: today,
@@ -287,6 +387,7 @@ function buildTodayViewModel(state) {
     doneToday: split.doneToday,
     doneTodayOpen: doneTodayOpen,
     needsMigration: state.needsMigration,
+    review: reviewVm,
     pickThree: { visible: showPick && suggestions.length > 0, welcome: welcome, suggestions: suggestions },
     pendingCaptures: buildPendingCaptures(state),
     inboxCount: state.tasks.filter(function (t) { return t.status === "inbox"; }).length,
@@ -332,6 +433,8 @@ const todayHandlers = {
     render();
     ui.openUnscheduledDrawer();
   },
+  onReviewApply: applyReview,
+  onReviewDismiss: dismissReview,
 };
 
 const weekHandlers = {
@@ -582,6 +685,10 @@ async function init() {
   if (hasKey) {
     await refreshTasks();
     flushQueue();
+    // Phase 7: after the task list, not before — a review's own text
+    // often refers to tasks by title, so it should never be able to race
+    // ahead of the list it's about. Fire-and-forget: see fetchReview().
+    fetchReview();
   }
 }
 

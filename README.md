@@ -11,7 +11,25 @@ security and reliability problems (see `docs/00-what-we-built-security.md`
 for the first one fixed). It's being replaced a phase at a time, with each
 phase actually used for a while before the next one starts.
 
-## Current status: Phase 6 — reminders + nightly tidy + morning digest
+## Current status: Phase 7 — weekly review (all planned phases done)
+
+Phase 7 adds a weekly review: once a week, a short, warm summary of the
+week just gone (1–3 concrete wins, never a count of what's undone), plus a
+small handful of suggestions — what's worth doing this week, what could
+rest in Someday, what looks stale enough to drop. It's written by an
+outside reviewer, not the app itself: Gemini automatically every Monday
+morning as a safety net, or Claude via a local scheduled task you set up
+yourself (the better writer, and it always wins if both exist for the same
+week). Every review is checked by `validateReview_` before it can touch
+the sheet, so a hallucinated task id or an overlong list can never reach
+what you see. See `docs/05-what-we-built-weekly-review.md` for what
+changed and why, `docs/RUNBOOK.md` section L for how to turn it on, and
+`tools/weekly-review/README.md` for setting up the Claude side of it.
+
+This is the last of the planned phases — the app now covers capture,
+scheduling, AI sorting, install-to-home-screen, sharing from other apps,
+calendar reminders, and a weekly review, all on a Google Sheet you can
+always open and read directly.
 
 Phase 6 adds real calendar reminders: every task with a due date gets an
 event (with a popup notification) in its own "Tasks" Google Calendar,
@@ -67,6 +85,7 @@ this repo, with the person driving the rebuild).
 | `js/ui.js` | All DOM rendering: task rows, the undo toast, the key/main screens. |
 | `js/app.js` | Wires the above together: what happens when you tap something. |
 | `js/sheets.js` | The action sheet, edit form and settings sheet (the three popups). |
+| `js/review.js` | The weekly review card (Phase 7): summary, wins, and the tickable suggestion lists. |
 | `test/logic.test.mjs` | Runs with plain `node test/logic.test.mjs` — no install needed. |
 | `spike.html` / `spike.js` | Phase 0 connection-test page: save a device key, Ping the server, List tasks. Kept for reference. |
 | `config.js` | Public config — the Apps Script URL(s). Safe to commit (see comment in the file for why). |
@@ -82,6 +101,8 @@ this repo, with the person driving the rebuild).
 | `docs/02-what-we-built-pwa.md` | Plain-English explanation of what Phase 3 built and why. |
 | `docs/03-what-we-built-ai-capture.md` | Plain-English explanation of what Phase 4 built and why. |
 | `docs/04-what-we-built-share-and-reminders.md` | Plain-English explanation of what Phases 5 and 6 built and why. |
+| `docs/05-what-we-built-weekly-review.md` | Plain-English explanation of what Phase 7 built and why. |
+| `tools/weekly-review/` | The Claude-side weekly review kit: `export.ps1`/`save.ps1` (PowerShell, call the backend), `PROMPT.md` (the scheduled task's exact instructions), `README.md` (setup steps). |
 
 ## Getting started
 

@@ -1,0 +1,5 @@
+# A review JSON file written locally while the scheduled task runs (see
+# PROMPT.md step 3) is scratch data, not something to commit — it's fully
+# reproducible from a fresh export.ps1 call, and by the time anyone would
+# look at it the real copy already lives in the Reviews tab of the sheet.
+*.review.json

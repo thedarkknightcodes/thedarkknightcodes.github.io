@@ -407,3 +407,69 @@ set of permissions and every calendar call fails with this message. Fix:
 4. Run `resync_calendar`, then `nightlyTidy`. The log should now show a
    digest event being created.
 
+---
+
+## L. Phase 7: weekly review
+
+Once a week, a short, warm review of the week just gone: 1–3 concrete
+wins, a small handful of tasks worth doing this week, a few that could
+rest in Someday, and a couple that look stale enough to drop — never a
+count of everything still undone. It's written either by Gemini
+automatically (Monday mornings, as a safety net) or by Claude (via a
+local scheduled task you set up yourself, using your own Claude Max
+subscription — see `tools/weekly-review/README.md`), and Claude's review
+always wins if both exist for the same week. See
+`docs/05-what-we-built-weekly-review.md` for the plain-English "why".
+
+No new Google permissions are needed for this phase — it reuses the same
+Sheets/Calendar/external-request/trigger scopes Phase 4 and Phase 6
+already asked for.
+
+1. Replace the contents of `Code.gs` with the latest
+   `apps-script/Code.gs` from this repo (section C), and save. (If you
+   haven't turned on Phase 4's AI capture yet, `GEMINI_API_KEY` also needs
+   to be set — see section I — since the same key powers the Monday
+   safety-net review.)
+2. Function dropdown → **`runTests`** → **Run**. Should end with "All …
+   tests passed." (this now also covers `validateReview_`, `mondayOf_`
+   and `isReviewFresh_` — all local checks, no network).
+3. Function dropdown → **`installTriggers`** → **Run**. Safe to re-run any
+   time (it always removes old triggers first) — this is what turns on
+   BOTH the nightly tidy (Phase 6) and the new weekly review trigger.
+   Check the Execution log for "Installed the nightly tidy trigger … and
+   the weekly review trigger …".
+4. Ship it: **Deploy → Manage deployments → pencil icon → Version: New
+   version → Deploy** (section C — same URL, no config change).
+5. Open the app, click **Ping** in Settings → version should now read
+   `0.5.0`.
+6. *(Optional, but recommended)* Set up the Claude scheduled task per
+   `tools/weekly-review/README.md` — a few minutes, one time, and it's
+   what gets you the better (Claude-written) review each week instead of
+   only Gemini's Monday-morning fallback.
+7. Try it now, rather than waiting for Monday: function dropdown →
+   **`weeklyGeminiReview`** → **Run**. Check the Execution log — it should
+   say either "saved a Gemini review for week …" or, if you already ran
+   the Claude scheduled task this week, "skipped (claude_review_exists)".
+8. Open the app (or reload it) — you should see a **"Your week, reviewed"**
+   card at the top of Today, tagged "by Gemini" (or "by Claude", if that's
+   the one that saved). Tick/untick as you like and try **Apply ticked**
+   and **Not now** — either one should make the card disappear.
+
+**If the review card never shows up:** check that `weeklyGeminiReview` (or
+the Claude scheduled task) actually ran and logged a save — a review more
+than `REVIEW_FRESH_DAYS` (10) days old auto-expires and `review_get` just
+returns null, same as if none was ever written (see `isReviewFresh_` in
+`Code.gs`).
+
+**Changing how many suggestions each list holds:** edit
+`REVIEW_MAX_SUGGESTED` / `REVIEW_MAX_SOMEDAY` / `REVIEW_MAX_DROP` near the
+top of `Code.gs`, then ship the change (section C). `validateReview_` and
+its tests all read from these same constants, so nothing else needs to
+change.
+
+**Changing when the weekly review trigger fires:** it's currently
+`onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(8)` in `installTriggers()`.
+Edit that line, then run **`installTriggers`** again (always safe — see
+step 3 above). **`removeTriggers`** turns off both the nightly tidy and
+the weekly review if you ever want to pause either.
+
