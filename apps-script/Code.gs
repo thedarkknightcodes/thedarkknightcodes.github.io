@@ -91,7 +91,7 @@
 
 // Bump this whenever you deploy a meaningfully different version. `ping`
 // returns it, so the phone/browser can show you which code it's talking to.
-const CODE_VERSION = "0.7.0";
+const CODE_VERSION = "0.7.1";
 
 // The app's own URL, used in calendar event descriptions ("Open: ...") so
 // a reminder always has a one-tap way back into the app.
@@ -182,6 +182,81 @@ const FADE_DAYS = 21;
 // an old one, or a question" is a harder job than just splitting a
 // brain-dump into lines).
 const GEMINI_MODEL_DEFAULT = "gemini-3.8-flash";
+
+// Backup models, tried in order when the main model is overloaded (HTTP
+// 503/429) or erroring (5xx). Override with a comma-separated Script
+// Property GEMINI_FALLBACK_MODELS. Check AI Studio's model list if one of
+// these is ever retired.
+const GEMINI_FALLBACK_MODELS_DEFAULT = "gemini-3.5-flash-lite,gemini-3.1-flash-lite";
+
+/**
+ * One place that talks to Gemini. Tries the main model (GEMINI_MODEL or the
+ * default), and if Google says "high demand" (503) or "slow down" (429) or
+ * any 5xx, waits a moment and retries once, then walks the fallback list.
+ * A 4xx other than 429 (bad key, bad request) is NOT retried — a different
+ * model won't fix a wrong key. Returns the model's text, or throws a short
+ * readable error that names the last failure.
+ */
+function geminiGenerate_(prompt, schema, temperature) {
+  const props = PropertiesService.getScriptProperties();
+  const apiKey = props.getProperty("GEMINI_API_KEY");
+  if (!apiKey) throw new Error("missing_gemini_key");
+
+  const primary = props.getProperty("GEMINI_MODEL") || GEMINI_MODEL_DEFAULT;
+  const fallbacks = (props.getProperty("GEMINI_FALLBACK_MODELS") || GEMINI_FALLBACK_MODELS_DEFAULT)
+    .split(",").map(function (m) { return m.trim(); }).filter(function (m) { return m && m !== primary; });
+  const models = [primary].concat(fallbacks);
+
+  const requestBody = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: schema,
+      temperature: temperature,
+    },
+  };
+
+  let lastError = "";
+  for (let m = 0; m < models.length; m++) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) Utilities.sleep(1500);
+      const url = "https://generativelanguage.googleapis.com/v1beta/models/" + models[m] + ":generateContent";
+      const response = UrlFetchApp.fetch(url, {
+        method: "post",
+        contentType: "application/json",
+        headers: { "x-goog-api-key": apiKey },
+        payload: JSON.stringify(requestBody),
+        muteHttpExceptions: true, // so a Gemini error comes back as text we can read, not a thrown exception with no detail
+      });
+      const status = response.getResponseCode();
+      if (status === 200) {
+        const text = extractGeminiText_(response.getContentText());
+        if (m > 0 || attempt > 0) Logger.log("Gemini: answered by " + models[m] + " (attempt " + (attempt + 1) + ") after: " + lastError);
+        return text;
+      }
+      lastError = "gemini_http_" + status + " [" + models[m] + "]: " + response.getContentText().slice(0, 160);
+      const retryable = status === 429 || status >= 500;
+      if (!retryable) throw new Error(lastError);
+    }
+  }
+  throw new Error(lastError || "gemini_unavailable");
+}
+
+/** Pulls the model's text out of a generateContent envelope, or throws. */
+function extractGeminiText_(bodyText) {
+  let envelope;
+  try {
+    envelope = JSON.parse(bodyText);
+  } catch (err) {
+    throw new Error("gemini_bad_json_envelope");
+  }
+  const text = envelope && envelope.candidates && envelope.candidates[0] &&
+    envelope.candidates[0].content && envelope.candidates[0].content.parts &&
+    envelope.candidates[0].content.parts[0] && envelope.candidates[0].content.parts[0].text;
+  if (!text) throw new Error("gemini_no_text_in_response");
+  return text;
+}
+
 
 // A brain-dump longer than this is trimmed before it's sent anywhere. This
 // isn't really about Gemini's limits (it can handle far more) — it's a
@@ -788,46 +863,8 @@ function writeNewTaskRows_(sheet, headers, rows, opId) {
  * which doCapture catches and turns into the one-task fallback.
  */
 function callGemini_(raw, todayStr) {
-  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
-  if (!apiKey) throw new Error("missing_gemini_key");
-
-  const model = PropertiesService.getScriptProperties().getProperty("GEMINI_MODEL") || GEMINI_MODEL_DEFAULT;
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent";
   const prompt = buildGeminiPrompt_(raw, todayStr);
-
-  const requestBody = {
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: {
-      responseMimeType: "application/json",
-      responseSchema: GEMINI_RESPONSE_SCHEMA,
-      temperature: 0.2,
-    },
-  };
-
-  const response = UrlFetchApp.fetch(url, {
-    method: "post",
-    contentType: "application/json",
-    headers: { "x-goog-api-key": apiKey },
-    payload: JSON.stringify(requestBody),
-    muteHttpExceptions: true, // so a Gemini error comes back as text we can read, not a thrown exception with no detail
-  });
-
-  const status = response.getResponseCode();
-  if (status !== 200) {
-    throw new Error("gemini_http_" + status + ": " + response.getContentText().slice(0, 200));
-  }
-
-  let envelope;
-  try {
-    envelope = JSON.parse(response.getContentText());
-  } catch (err) {
-    throw new Error("gemini_bad_json_envelope");
-  }
-
-  const text = envelope && envelope.candidates && envelope.candidates[0] &&
-    envelope.candidates[0].content && envelope.candidates[0].content.parts &&
-    envelope.candidates[0].content.parts[0] && envelope.candidates[0].content.parts[0].text;
-  if (!text) throw new Error("gemini_no_text_in_response");
+  const text = geminiGenerate_(prompt, GEMINI_RESPONSE_SCHEMA, 0.2);
 
   return parseGeminiTasks_(text);
 }
@@ -932,6 +969,18 @@ function test_assist() {
  * sourceBadge) instead of the usual "ai"/"fallback". Every other caller
  * omits it and gets today's ordinary behaviour.
  */
+/**
+ * PURE: a rough "is this a question rather than a thing to do?" check, only
+ * used when the AI is unavailable. Deliberately conservative — when in
+ * doubt it says "not a question", so real tasks are never thrown away.
+ */
+function looksLikeQuestion_(raw) {
+  const t = String(raw || "").trim().toLowerCase();
+  if (!t) return false;
+  if (t.endsWith("?")) return true;
+  return /^(what|what's|whats|when|when's|where|which|who|why|how|is|are|can|could|should|have|has|am)\b/.test(t);
+}
+
 function doAssistInternal_(request, dryRun, taskSourceOverride) {
   const payload = request.payload || {};
   const rawInput = String(payload.raw || "").trim();
@@ -1003,6 +1052,11 @@ function doAssistInternal_(request, dryRun, taskSourceOverride) {
   let response;
   if (assistResult) {
     response = applyAssistWrites_(tasksSheet, tasksHeaders, assistResult, raw, nowIso, opId, taskSourceOverride);
+  } else if (looksLikeQuestion_(raw)) {
+    // A question filed as a task would be silly ("what's due this week?"
+    // sitting in the Inbox). If the AI is down, say so instead — the text
+    // is still in the Log, nothing is lost.
+    response = { ok: true, intent: "question", reply: "I couldn't reach the AI just now — try again in a moment.", tasks: [], updated: [], source: "fallback", reason: failureReason || "no_usable_result" };
   } else {
     // Exactly doCapture's fallback: the whole raw text, saved as one task
     // in the Inbox, so a Gemini outage never loses what was typed/said.
@@ -1058,46 +1112,8 @@ function findStoredAssistResult_(sheet, headers, opId) {
  * failure: fall back to one Inbox task.
  */
 function callGeminiAssist_(raw, todayStr, contextTasks) {
-  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
-  if (!apiKey) throw new Error("missing_gemini_key");
-
-  const model = PropertiesService.getScriptProperties().getProperty("GEMINI_MODEL") || GEMINI_MODEL_DEFAULT;
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent";
   const prompt = buildAssistPrompt_(raw, todayStr, contextTasks);
-
-  const requestBody = {
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: {
-      responseMimeType: "application/json",
-      responseSchema: ASSIST_RESPONSE_SCHEMA,
-      temperature: 0.2,
-    },
-  };
-
-  const response = UrlFetchApp.fetch(url, {
-    method: "post",
-    contentType: "application/json",
-    headers: { "x-goog-api-key": apiKey },
-    payload: JSON.stringify(requestBody),
-    muteHttpExceptions: true,
-  });
-
-  const status = response.getResponseCode();
-  if (status !== 200) {
-    throw new Error("gemini_http_" + status + ": " + response.getContentText().slice(0, 200));
-  }
-
-  let envelope;
-  try {
-    envelope = JSON.parse(response.getContentText());
-  } catch (err) {
-    throw new Error("gemini_bad_json_envelope");
-  }
-
-  const text = envelope && envelope.candidates && envelope.candidates[0] &&
-    envelope.candidates[0].content && envelope.candidates[0].content.parts &&
-    envelope.candidates[0].content.parts[0] && envelope.candidates[0].content.parts[0].text;
-  if (!text) throw new Error("gemini_no_text_in_response");
+  const text = geminiGenerate_(prompt, ASSIST_RESPONSE_SCHEMA, 0.2);
 
   return text;
 }
@@ -2804,46 +2820,8 @@ function buildReviewPrompt_(tasks, recentCaptures, weekStart, todayStr) {
  * for why there's no fallback review, unlike capture's fallback task).
  */
 function callGeminiForReview_(tasks, recentCaptures, weekStart, todayStr) {
-  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
-  if (!apiKey) throw new Error("missing_gemini_key");
-
-  const model = PropertiesService.getScriptProperties().getProperty("GEMINI_MODEL") || GEMINI_MODEL_DEFAULT;
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent";
   const prompt = buildReviewPrompt_(tasks, recentCaptures, weekStart, todayStr);
-
-  const requestBody = {
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: {
-      responseMimeType: "application/json",
-      responseSchema: REVIEW_RESPONSE_SCHEMA,
-      temperature: 0.3,
-    },
-  };
-
-  const response = UrlFetchApp.fetch(url, {
-    method: "post",
-    contentType: "application/json",
-    headers: { "x-goog-api-key": apiKey },
-    payload: JSON.stringify(requestBody),
-    muteHttpExceptions: true,
-  });
-
-  const status = response.getResponseCode();
-  if (status !== 200) {
-    throw new Error("gemini_http_" + status + ": " + response.getContentText().slice(0, 200));
-  }
-
-  let envelope;
-  try {
-    envelope = JSON.parse(response.getContentText());
-  } catch (err) {
-    throw new Error("gemini_bad_json_envelope");
-  }
-
-  const text = envelope && envelope.candidates && envelope.candidates[0] &&
-    envelope.candidates[0].content && envelope.candidates[0].content.parts &&
-    envelope.candidates[0].content.parts[0] && envelope.candidates[0].content.parts[0].text;
-  if (!text) throw new Error("gemini_no_text_in_response");
+  const text = geminiGenerate_(prompt, REVIEW_RESPONSE_SCHEMA, 0.3);
 
   let parsed;
   try {
@@ -3836,6 +3814,7 @@ function generateDeviceKey_() {
 
 function runTests() {
   const results = [];
+  test_looksLikeQuestion_(results);
 
   test_constantTimeEquals_matches_(results);
   test_constantTimeEquals_rejectsWrongLength_(results);
@@ -3958,6 +3937,13 @@ function runTests() {
   Logger.log(failed.length === 0
     ? "\nAll " + results.length + " tests passed."
     : "\n" + failed.length + " of " + results.length + " tests FAILED.");
+}
+
+function test_looksLikeQuestion_(results) {
+  assert_(results, "looksLikeQuestion_ spots a question mark", looksLikeQuestion_("what's due this week?") === true);
+  assert_(results, "looksLikeQuestion_ spots a question word", looksLikeQuestion_("What should I do next") === true);
+  assert_(results, "looksLikeQuestion_ leaves a plain task alone", looksLikeQuestion_("renew passport by friday") === false);
+  assert_(results, "looksLikeQuestion_ leaves 'do the washing' alone", looksLikeQuestion_("do the washing") === false);
 }
 
 function assert_(results, name, condition) {

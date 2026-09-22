@@ -648,3 +648,15 @@ again — always safe, it removes old triggers first. `removeTriggers` turns
 every trigger this app manages off, including these two, the nightly tidy
 and the weekly review.
 
+
+---
+
+## O. If the AI is "experiencing high demand"
+
+Google sometimes returns a 503 "high demand" error for a popular model.
+From v0.7.1 the script retries once, then tries backup models in order
+(`gemini-3.5-flash-lite`, then `gemini-3.1-flash-lite`). To change the
+backups, add a Script Property `GEMINI_FALLBACK_MODELS` with a
+comma-separated list of model names from AI Studio. Questions asked while
+every model is down get a polite "try again in a moment" reply instead of
+being filed as a task.

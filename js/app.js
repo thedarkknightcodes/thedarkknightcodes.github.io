@@ -330,7 +330,9 @@ function applyAssistResult(op, data) {
     }
   }
 
-  if (data.source === "fallback") {
+  // Only say "saved as a note" when a note was actually saved — a question
+  // asked while the AI was down gets its reply card below instead.
+  if (data.source === "fallback" && created.length > 0) {
     ui.showToast("Saved as one note for now — you can split it later.");
   }
 
