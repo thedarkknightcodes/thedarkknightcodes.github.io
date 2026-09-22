@@ -160,3 +160,30 @@ device: **Windows, Mac, iPad, Pixel (Android)**.
       it should no longer return any task data.
 
 If every box is ticked on every device, Phase 0 is done.
+
+---
+
+## G. Phase 1: migrate your tasks into the new data model
+
+The new app reads from a new tab called `Tasks2` (with real dates, ids that
+can't collide, and so on). Your old tab is **never changed** — it stays as
+a backup.
+
+1. In the Apps Script editor, replace the contents of `Code.gs` with the
+   latest `apps-script/Code.gs` from this repo, and save.
+2. Function dropdown → choose **`runTests`** → **Run**. The Execution log
+   should end with "All … tests passed."
+3. Function dropdown → choose **`migrate`** → **Run**. Authorise again if
+   asked. The log should say something like "Migrated 74 tasks … The legacy
+   tab was not changed."
+4. Go back to the Google Sheet tab in your browser. You should now see three
+   new tabs at the bottom: **Tasks2** (with your tasks), **Log** and
+   **Reviews** (empty apart from a header row). Old tasks marked Done in the
+   original tab are carried over as done but hidden from the app.
+5. Ship the new code: **Deploy → Manage deployments → pencil icon → Version:
+   New version → Deploy** (section C — same URL, no config change).
+6. Open `spike.html`, click **Ping** → version should now read `0.2.0`.
+   Click **List tasks** → the count should match your active tasks.
+
+Running `migrate` a second time does nothing (it refuses if Tasks2 already
+has rows), so it's safe if you click it twice by mistake.

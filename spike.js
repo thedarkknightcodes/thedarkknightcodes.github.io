@@ -204,7 +204,10 @@ async function handleList() {
     const { data, elapsedMs } = await api("list", {});
     const tasks = Array.isArray(data.tasks) ? data.tasks : [];
     const firstFive = tasks.slice(0, 5).map(function (t) {
-      return "- " + (t.task || "(untitled)");
+      // Phase 1's `list` returns {title}; the legacy `list_legacy` shape
+      // returns {task}. Falling back covers either one so this page keeps
+      // working no matter which the button is wired to.
+      return "- " + (t.title || t.task || "(untitled)");
     });
     showResult(
       "List OK (" + elapsedMs + "ms)\n" +
