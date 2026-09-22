@@ -90,9 +90,15 @@ function dateOnly(iso) {
 // --- capture ---------------------------------------------------------------
 
 /**
- * Turns raw textarea text into one task object per non-empty line. This is
- * the whole of Phase 2 capture: no AI sorting yet, just "each line is a
- * task" — plain and predictable, so it's obvious what pressing Add did.
+ * LEGACY / OFFLINE FALLBACK — not used by the main capture flow any more.
+ *
+ * This was the whole of Phase 2 capture: no AI sorting, just "each line is
+ * a task" — plain and predictable. Phase 4 replaced the main flow with a
+ * `capture` call to the backend, which asks Gemini to split a ramble into
+ * tasks itself (see app.js's handleCapture). This function is kept around
+ * (with its tests) as a simple, dependency-free splitter that still works
+ * with no network at all — nothing currently calls it, but it's a natural
+ * fit if a fully-offline capture mode is ever added later.
  */
 export function captureText(raw, opts) {
   opts = opts || {};
@@ -262,6 +268,18 @@ export function weekDates(today, days) {
 
 export function unscheduledActiveTasks(tasks) {
   return tasks.filter(function (t) { return t.status === "active" && !t.do_date; });
+}
+
+/**
+ * Tasks captured but not yet sorted (status "inbox") — the fallback path
+ * lands here when the AI couldn't split a ramble, and the person hasn't
+ * gone through and re-categorised it yet. Sorted oldest-first, same as the
+ * other lists, so the earliest capture doesn't get buried under new ones.
+ */
+export function inboxTasks(tasks) {
+  return tasks
+    .filter(function (t) { return t.status === "inbox"; })
+    .sort(function (a, b) { return String(a.created_at || "").localeCompare(String(b.created_at || "")); });
 }
 
 export function filterTasksByText(tasks, query) {

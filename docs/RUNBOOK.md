@@ -66,6 +66,11 @@ The previous version of this app had its Apps Script URL sitting in a
 public GitHub repository with **no password check at all**. That old URL
 must be shut off.
 
+**Already done if you shipped the new code with "New version" on the
+existing deployment** — that keeps the same URL but the new code behind it
+refuses anything without the device key, which is what matters. Only follow
+the steps below if you created a *separate* new deployment.
+
 1. In the Apps Script editor: **Deploy → Manage deployments**.
 2. Find the **old** deployment (the one whose URL matches what used to be
    in `index.html`).
@@ -223,3 +228,57 @@ appears if a new version was already downloading in the background.
 copy won't notice on its own — you need to remove it from the home screen
 and add it again. This doesn't apply to ordinary code changes, only to
 `manifest.webmanifest` or the files in `icons/`.
+
+---
+
+## I. Phase 4: turn on AI capture
+
+This turns the capture box into a "brain-dump" box: type or paste a messy
+ramble, and Gemini (a Google AI model) splits it into separate tasks for
+you. If Gemini is ever unreachable, nothing is lost — the whole ramble is
+saved as one task in your Inbox instead, ready to sort by hand later. See
+`docs/03-what-we-built-ai-capture.md` for the plain-English "why".
+
+1. **Get a Gemini API key.** Go to
+   [aistudio.google.com](https://aistudio.google.com), sign in with your
+   Google account, and create an API key (it's free to start, with a
+   generous daily limit — see the caveat at the end of this section).
+   Copy the key somewhere safe for a moment.
+2. In the Apps Script editor: **Project Settings** (gear icon) → **Script
+   Properties** → **Add script property**.
+   - Name: `GEMINI_API_KEY`, Value: the key you just copied.
+3. *(Optional)* Add a second Script Property, `GEMINI_MODEL`, if you ever
+   want to point at a different Gemini model than the one this code
+   defaults to. Most people can skip this — leave it unset.
+4. Replace the contents of `Code.gs` with the latest
+   `apps-script/Code.gs` from this repo (same as any other code update —
+   see section C), and save.
+5. Function dropdown → choose **`runTests`** → **Run**. The Execution log
+   should end with "All … tests passed." (these are all local checks —
+   they don't call Gemini or spend any quota).
+6. Function dropdown → choose **`test_gemini`** → **Run**. This sends one
+   sample ramble to Gemini for real. Open **Execution log**:
+   - If you see "Success — Gemini split it into N task(s)" followed by
+     some JSON, the key works. You're done.
+   - If you see "callGemini_ failed", read the error line under it — it's
+     usually a copy-paste mistake in the key, or the key not having access
+     to the model yet (Google can take a minute to activate a brand new
+     key).
+7. Ship it: **Deploy → Manage deployments → pencil icon → Version: New
+   version → Deploy** (section C — same URL, no config change).
+8. Open the app, click **Ping** in Settings → version should now read
+   `0.3.0`.
+
+**About that re-authorisation prompt:** this is the first phase where the
+script talks to something outside your own Google account (Gemini's API),
+so the very next time you run anything from the Apps Script editor, Google
+will ask you to re-authorise the script for a new permission ("Connect to
+an external service"). This is expected — click through it the same way
+you did in section A, step 10.
+
+**A caveat on the free tier:** Google's free Gemini API tier is generous
+for one person's brain-dumps, but it comes with daily/per-minute request
+limits and its terms note that free-tier prompts may be used to improve
+Google's models. If that matters to you, read Google AI Studio's current
+terms before relying on this for anything sensitive — a paid tier removes
+both concerns.

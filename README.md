@@ -11,9 +11,17 @@ security and reliability problems (see `docs/00-what-we-built-security.md`
 for the first one fixed). It's being replaced a phase at a time, with each
 phase actually used for a while before the next one starts.
 
-## Current status: Phase 3 — minimal PWA
+## Current status: Phase 4 — AI brain-dump capture
 
-Phase 3 makes the app installable: a manifest and icons so "Install app" /
+Phase 4 turns the capture box into a "brain-dump" box: type or paste a
+messy ramble, and Gemini (a Google AI model) splits it into separate,
+tidy tasks for you. Your raw text is always logged before the AI is ever
+called, and if Gemini fails for any reason the whole ramble is saved as
+one Inbox task instead of being lost. See
+`docs/03-what-we-built-ai-capture.md` for what changed and why, and
+`docs/RUNBOOK.md` section I for how to turn it on.
+
+Phase 3 made the app installable: a manifest and icons so "Install app" /
 "Add to Home Screen" works on Pixel and iPad, plus a service worker that
 caches the app shell (the screen itself, not your tasks) so it still opens
 with no signal. See `docs/02-what-we-built-pwa.md` for what changed and

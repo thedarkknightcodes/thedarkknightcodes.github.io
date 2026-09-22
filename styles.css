@@ -324,6 +324,62 @@ p { margin: 0 0 8px; }
   gap: 8px;
   margin-top: 8px;
 }
+/* Subtle "Sorting…" hint on the capture box itself, once you've hit Add —
+   the box stays usable for the next ramble the whole time this is showing. */
+.capture-feedback {
+  margin: 6px 4px 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  min-height: 1em;
+}
+
+/* ---------------------------------------------------------------------
+   Pending captures (rows at the top of Today while the AI is sorting)
+   --------------------------------------------------------------------- */
+
+.pending-captures { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.pending-capture-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg-elevated);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+.pending-capture-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+/* ---------------------------------------------------------------------
+   Inbox link (Today) — quiet, on purpose: this is new stuff to sort, not
+   a backlog count, so it never gets the red/urgent treatment.
+   --------------------------------------------------------------------- */
+
+.inbox-link {
+  display: block;
+  width: 100%;
+  text-align: left;
+  min-height: 36px;
+  margin-bottom: 12px;
+  padding: 0 4px;
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.inbox-section { margin-bottom: 14px; }
+.inbox-heading { color: var(--accent); }
 
 /* ---------------------------------------------------------------------
    Cards (Pick 3)
@@ -375,6 +431,14 @@ p { margin: 0 0 8px; }
   0% { transform: scale(1); }
   40% { transform: scale(1.015); }
   100% { transform: scale(1); }
+}
+/* Brief highlight for a task that just landed on Today straight out of an
+   AI capture. The global prefers-reduced-motion rule earlier in this file
+   already collapses this to an instant, flicker-free change. */
+.task-row.task-row-new { animation: highlight-fade 1.6s ease-out; }
+@keyframes highlight-fade {
+  0% { background: var(--accent-soft); border-color: var(--accent); }
+  100% { background: var(--bg-elevated); border-color: var(--border); }
 }
 
 .check-btn {

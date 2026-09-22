@@ -32,10 +32,28 @@ let currentTab = "today";
 let doneTodayOpen = false;
 let unscheduledFilterValue = "";
 let pickThreeDismissed = false;
+// The "Pick 3" suggestions must stay put between re-renders (every save
+// re-draws the screen) — otherwise the list keeps changing under your
+// finger. Only the Shuffle button changes this seed.
+let pickSeed = 1;
+function seededRandom(seed) {
+  let s = seed >>> 0;
+  return function () {
+    s = (s + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 let flushing = false;
 let retryAttempt = 0;
 let retryTimer = null;
 let deferredInstallPrompt = null; // captured "beforeinstallprompt" event, Android/Chrome only
+
+// Ids of tasks that just landed via an AI capture, so Today can give them a
+// brief highlight. Purely visual, never persisted — a reload just means you
+// miss the highlight, which is fine.
+let highlightedTaskIds = new Set();
 
 // Read once at startup, before we overwrite it with today's date — this is
 // what lets Pick 3 tell "opened yesterday" from "haven't opened in a week".
@@ -65,7 +83,8 @@ async function flushQueue() {
       }
       store.setSyncStatus("saving");
       try {
-        await api.api(op.action, op.payload);
+        const result = await api.api(op.action, op.payload);
+        if (op.action === "capture") applyCaptureResult(op, result.data);
         store.dequeueOp(op.op_id);
         retryAttempt = 0;
       } catch (err) {
@@ -78,6 +97,14 @@ async function flushQueue() {
           store.setSyncStatus("retry");
           ui.showKeyScreen(err.code === "locked" ? "Too many attempts — try again in a few minutes." : "");
           return;
+        }
+        if (op.action === "capture") {
+          // The server refused this outright (e.g. an empty raw somehow
+          // got this far) rather than a network blip — nothing was saved,
+          // and nothing here can succeed by retrying, so just say so.
+          store.dequeueOp(op.op_id);
+          ui.showToast("That capture didn't save — try again.");
+          continue;
         }
         // Some other ApiError: this op can never succeed as-is. Drop it,
         // quietly refetch the truth from the server, and say so gently
@@ -132,20 +159,77 @@ function applyFieldUpdate(task, fields, toastMessage) {
   });
 }
 
+/**
+ * The main capture flow (Phase 4): one messy ramble goes to the backend as
+ * a single `capture` op, and Gemini splits it into tasks server-side. We
+ * never wait for that reply before confirming — the op is queued (so it
+ * survives a reload and retries itself if you're offline) and a toast
+ * fires immediately. `todayOn` is remembered on the op itself so that, once
+ * the AI result eventually comes back, we can honour the "Today" chip for
+ * whichever of ITS tasks the AI left undated (see applyCaptureResult).
+ */
 function handleCapture(raw, todayOn) {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) return;
+
   const today = store.getState().serverToday;
-  const tasks = logic.captureText(raw, { today: today, todayOn: todayOn });
-  if (!tasks.length) return;
+  const opId = logic.randomId();
+
+  store.enqueueOp({
+    op_id: opId,
+    action: "capture",
+    payload: { raw: trimmed, op_id: opId, today_hint: today },
+    todayOn: !!todayOn,
+  });
+  flushQueue();
+
+  ui.showToast("Got it ✓");
+}
+
+/**
+ * Runs once a `capture` op's server response comes back. Merges the new
+ * tasks into the store, honours the "Today" chip for any the AI left
+ * undated, tells you gently if it had to fall back to one Inbox note, and
+ * gives the new tasks a brief highlight on the Today screen.
+ */
+function applyCaptureResult(op, data) {
+  const tasks = data.tasks || [];
+  const today = store.getState().serverToday;
+
   for (const task of tasks) {
     store.upsertTask(task);
-    store.enqueueOp({ op_id: task.id, action: "add", payload: { task: task, op_id: task.id } });
   }
-  flushQueue();
-  // This confirms the capture landed *locally* — it always fires, online or
-  // off, because step 1 (save it locally) already happened above. The sync
-  // dot is what tells you whether it's reached the server yet; nothing
-  // here should look alarming just because you're offline for a bit.
-  ui.showToast("Got it ✓");
+
+  if (op.todayOn) {
+    for (const task of tasks) {
+      // Only fill in a date the AI left blank — an AI-chosen date (or one
+      // it correctly left off because it was a "someday" kind of item)
+      // always wins over the chip.
+      if (!task.do_date && !task.due_date) {
+        store.patchTask(task.id, { do_date: today });
+        queueUpdate(task.id, { do_date: today });
+      }
+    }
+  }
+
+  if (data.source === "fallback") {
+    ui.showToast("Saved as one note for now — you can split it later.");
+  }
+
+  highlightTaskIds(tasks.map(function (t) { return t.id; }));
+}
+
+/** Marks a set of task ids as "just arrived" for one render, then clears
+ * it — see the .task-row-new rule in styles.css for the actual highlight
+ * (which the page's reduced-motion rule already neutralises when needed). */
+function highlightTaskIds(ids) {
+  if (!ids.length) return;
+  for (const id of ids) highlightedTaskIds.add(id);
+  render();
+  setTimeout(function () {
+    for (const id of ids) highlightedTaskIds.delete(id);
+    render();
+  }, 1600);
 }
 
 function handleToggleDone(task) {
@@ -159,6 +243,19 @@ function handleToggleDone(task) {
 // ---------------------------------------------------------------------------
 // view models — turn store state into what ui.js needs to draw a screen
 // ---------------------------------------------------------------------------
+
+function buildPendingCaptures(state) {
+  return state.queue
+    .filter(function (op) { return op.action === "capture"; })
+    .map(function (op) {
+      const raw = (op.payload && op.payload.raw) || "";
+      return {
+        op_id: op.op_id,
+        preview: raw.slice(0, 40),
+        waiting: state.syncStatus === "retry",
+      };
+    });
+}
 
 function buildTodayViewModel(state) {
   const today = state.serverToday;
@@ -174,7 +271,7 @@ function buildTodayViewModel(state) {
 
   const alreadyToday = new Set(split.scheduled.map(function (t) { return t.id; }).concat(split.dueToday.map(function (t) { return t.id; })));
   const candidates = activeAll.filter(function (t) { return !alreadyToday.has(t.id); });
-  const suggestions = showPick ? logic.pickThree(candidates, today, Math.random) : [];
+  const suggestions = showPick ? logic.pickThree(candidates, today, seededRandom(pickSeed)) : [];
 
   return {
     scheduled: split.scheduled,
@@ -183,6 +280,9 @@ function buildTodayViewModel(state) {
     doneTodayOpen: doneTodayOpen,
     needsMigration: state.needsMigration,
     pickThree: { visible: showPick && suggestions.length > 0, welcome: welcome, suggestions: suggestions },
+    pendingCaptures: buildPendingCaptures(state),
+    inboxCount: state.tasks.filter(function (t) { return t.status === "inbox"; }).length,
+    highlightedIds: highlightedTaskIds,
   };
 }
 
@@ -198,8 +298,9 @@ function buildWeekViewModel(state) {
   const unscheduled = logic.unscheduledActiveTasks(state.tasks);
   const filtered = logic.filterTasksByText(unscheduled, unscheduledFilterValue);
   const groups = logic.groupByCategory(filtered);
+  const inbox = logic.inboxTasks(state.tasks);
 
-  return { today: today, days: days, unscheduled: { groups: groups, filterValue: unscheduledFilterValue } };
+  return { today: today, days: days, inbox: inbox, unscheduled: { groups: groups, filterValue: unscheduledFilterValue } };
 }
 
 function buildSomedayViewModel(state) {
@@ -216,8 +317,13 @@ const todayHandlers = {
   onAddToToday: function (task) {
     applyFieldUpdate(task, { do_date: store.getState().serverToday }, "Added to today");
   },
-  onShuffle: function () { render(); },
+  onShuffle: function () { pickSeed += 1; render(); },
   onNotNow: function () { pickThreeDismissed = true; render(); },
+  onOpenInboxLink: function () {
+    currentTab = "week";
+    render();
+    ui.openUnscheduledDrawer();
+  },
 };
 
 const weekHandlers = {
@@ -231,19 +337,28 @@ const somedayHandlers = {
   onBringBack: function (task) { applyFieldUpdate(task, { status: "active", do_date: "" }, "Back on the list"); },
 };
 
+/** A task sitting in the Inbox (an unsorted AI-fallback capture) is, by
+ * definition, "sorted" the moment you schedule, edit or otherwise decide
+ * what it is from its action sheet — this bumps it from "inbox" to
+ * "active" whenever that happens, so it leaves the Inbox section instead
+ * of sitting there forever even after you've dealt with it. */
+function withSortedStatus(task, fields) {
+  return task.status === "inbox" ? Object.assign({}, fields, { status: "active" }) : fields;
+}
+
 const sheetHandlers = {
   onMove: function (task, when) {
     const today = store.getState().serverToday;
     const date = when === "today" ? today : logic.addDays(today, 1);
-    applyFieldUpdate(task, { do_date: date }, when === "today" ? "Moved to today" : "Moved to tomorrow");
+    applyFieldUpdate(task, withSortedStatus(task, { do_date: date }), when === "today" ? "Moved to today" : "Moved to tomorrow");
   },
-  onPickDay: function (task, dateStr) { applyFieldUpdate(task, { do_date: dateStr }, "Scheduled"); },
+  onPickDay: function (task, dateStr) { applyFieldUpdate(task, withSortedStatus(task, { do_date: dateStr }), "Scheduled"); },
   onUnschedule: function (task) { applyFieldUpdate(task, { do_date: "" }, "Unscheduled"); },
   onSomeday: function (task) { applyFieldUpdate(task, { status: "someday", do_date: "" }, "Moved to Someday"); },
   onDrop: function (task) { applyFieldUpdate(task, { status: "dropped" }, "Dropped"); },
   onEditSave: function (id, fields) {
     const task = store.getState().tasks.find(function (t) { return t.id === id; });
-    if (task) applyFieldUpdate(task, fields, "Saved");
+    if (task) applyFieldUpdate(task, withSortedStatus(task, fields), "Saved");
   },
 };
 

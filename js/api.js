@@ -99,6 +99,17 @@ export function isMockMode() {
   }
 }
 
+/** `?mock=1&fallback=1` forces every mock capture down the fallback path
+ * (one task, straight into the Inbox) — the easiest way to see and test
+ * that side of the flow without having to break anything for real. */
+function isMockFallbackForced() {
+  try {
+    return new URLSearchParams(window.location.search).get("fallback") === "1";
+  } catch (err) {
+    return false;
+  }
+}
+
 // --- the real network call ------------------------------------------------
 
 async function realCall(action, payload) {
@@ -244,19 +255,117 @@ function mockUpdate(tasks, payload) {
   return { ok: true, task: cloneTask(task) };
 }
 
+// --- fake brain-dump splitter (mock capture) --------------------------
+// A rough stand-in for what Gemini does server-side: cut the ramble into
+// pieces on the obvious separators, and guess a category from a few
+// keywords per piece. It doesn't need to be smart — it only exists so
+// `?mock=1` can demonstrate the whole capture flow (pending row, toast,
+// highlight, fallback) without a real backend or API key.
+
+const MOCK_CATEGORY_RULES = [
+  [/dentist|doctor|\bgp\b|prescription|workout|gym|health|meds|medicine|checkup/i, "Health & Personal Care"],
+  [/\bbill\b|invoice|\bbank\b|\bpay\b|subscription|renew|insurance|\btax\b/i, "Finances & Subscriptions"],
+  [/clean|laundry|dishes|hoover|\bbin\b|tidy|garden|fix\b|chore/i, "Household & Chores"],
+  [/\bbuy\b|\bshop\b|groceries|\bmilk\b|present|\bgift\b/i, "Shopping & Groceries"],
+  [/flight|holiday|\btrip\b|hotel|passport|travel/i, "Holidays & Travel"],
+  [/\bread\b|\bwatch\b|\bfilm\b|movie|\bgame\b|hobby|book\b/i, "Leisure & Pending Experiences"],
+  [/\bemail\b|\bform\b|\badmin\b|\bfile\b|appointment|\bcall\b/i, "Admin & Organization"],
+  [/\bmum\b|\bdad\b|sister|brother|\bfriend\b|family|partner|birthday/i, "Relationship & Family"],
+  [/\bcourse\b|\blearn\b|\bstudy\b|\bcv\b|resume|\bwork\b|project/i, "Career & Learning"],
+];
+
+function guessMockCategory(text) {
+  for (const rule of MOCK_CATEGORY_RULES) {
+    if (rule[0].test(text)) return rule[1];
+  }
+  return "Inbox";
+}
+
+function splitMockBrainDump(raw) {
+  return String(raw || "")
+    .split(/\n|,| and /i)
+    .map(function (s) { return s.trim(); })
+    .filter(function (s) { return s.length > 0; })
+    .slice(0, 15);
+}
+
+function makeMockId() {
+  return typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : "mock-" + Date.now() + "-" + Math.floor(Math.random() * 1e6);
+}
+
+function mockCaptureFallbackRow(raw, opId, now) {
+  const firstLine = raw.split("\n")[0].trim() || raw.trim();
+  const title = firstLine.length > 80 ? firstLine.slice(0, 80) + "…" : firstLine;
+  return {
+    id: makeMockId(), title: title, notes: raw, category: "Inbox", est_min: null,
+    status: "inbox", do_date: "", due_date: "", due_time: "", sort: "",
+    created_at: now, updated_at: now, completed_at: "", calendar_event_id: "",
+    source: "fallback", raw_input: raw, op_id: opId,
+  };
+}
+
+function mockCapture(tasks, payload) {
+  const opId = String((payload && payload.op_id) || "");
+  const raw = String((payload && payload.raw) || "").trim();
+
+  // Idempotency, same contract as the real backend: a retried op_id gets
+  // back whatever was already saved, instead of a second copy.
+  if (opId) {
+    const existing = tasks.filter(function (t) { return t.op_id === opId; });
+    if (existing.length) {
+      const dupSource = existing[0].source === "fallback" ? "fallback" : "ai";
+      return { ok: true, tasks: existing.map(cloneTask), source: dupSource, duplicate: true };
+    }
+  }
+  if (!raw) return { ok: false, error: "missing_text" };
+
+  const now = new Date().toISOString();
+  const pieces = splitMockBrainDump(raw);
+  const useFallback = isMockFallbackForced() || pieces.length === 0;
+
+  let rows;
+  let source;
+  if (useFallback) {
+    rows = [mockCaptureFallbackRow(raw, opId, now)];
+    source = "fallback";
+  } else {
+    rows = pieces.map(function (line) {
+      const title = line.length > 80 ? line.slice(0, 80) : line;
+      return {
+        id: makeMockId(), title: title, notes: "", category: guessMockCategory(line),
+        est_min: 15, status: "active", do_date: "", due_date: "", due_time: "", sort: "",
+        created_at: now, updated_at: now, completed_at: "", calendar_event_id: "",
+        source: "ai", raw_input: raw, op_id: opId,
+      };
+    });
+    source = "ai";
+  }
+
+  for (const row of rows) tasks.push(row);
+  return { ok: true, tasks: rows.map(cloneTask), source: source };
+}
+
 async function mockCall(action, payload) {
   await delay(260 + Math.random() * 80);
   const tasks = ensureMockSeed();
   const today = todayStr();
 
   if (action === "ping") {
-    return { ok: true, version: "mock-0.2.0", time: new Date().toISOString(), tz: "Mock/Local" };
+    return { ok: true, version: "mock-0.3.0", time: new Date().toISOString(), tz: "Mock/Local" };
   }
   if (action === "list") {
     return { ok: true, tasks: tasks.map(cloneTask), server_time: new Date().toISOString(), today: today };
   }
   if (action === "add") return mockAdd(tasks, payload);
   if (action === "update") return mockUpdate(tasks, payload);
+  if (action === "capture") {
+    // The real Gemini call takes a few seconds — fake that so the pending
+    // row / "Sorting…" state actually has something to show off.
+    await delay(900 + Math.random() * 300);
+    return mockCapture(tasks, payload);
+  }
   return { ok: false, error: "unknown_action" };
 }
 

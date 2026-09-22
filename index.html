@@ -70,7 +70,7 @@
         </p>
 
         <form id="capture-form" class="capture">
-          <textarea id="capture-input" class="capture-input" placeholder="What's on your mind?" rows="1" aria-label="Capture a task"></textarea>
+          <textarea id="capture-input" class="capture-input" placeholder="What's on your mind? One thing or ten." rows="1" aria-label="Capture a task"></textarea>
           <div class="capture-row">
             <label class="chip-toggle">
               <input type="checkbox" id="today-toggle" checked>
@@ -78,7 +78,11 @@
             </label>
             <button type="submit" id="capture-submit" class="btn btn-primary">Add</button>
           </div>
+          <p id="capture-feedback" class="capture-feedback" aria-live="polite"></p>
         </form>
+
+        <div id="pending-captures" class="pending-captures" aria-live="polite"></div>
+        <button type="button" id="inbox-link" class="inbox-link" hidden></button>
 
         <div id="pick-three-card" class="card pick-three" hidden></div>
 
@@ -91,6 +95,7 @@
         <div id="week-strip" class="week-strip"></div>
         <details id="unscheduled-drawer" class="drawer">
           <summary>Not scheduled yet</summary>
+          <div id="inbox-section" class="inbox-section"></div>
           <input type="text" id="unscheduled-filter" class="filter-input" placeholder="Filter by title, notes or category">
           <div id="unscheduled-groups"></div>
         </details>

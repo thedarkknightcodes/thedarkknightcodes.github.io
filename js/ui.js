@@ -44,6 +44,8 @@ export function init(handlers) {
   refs.captureInput = el("capture-input");
   refs.todayToggle = el("today-toggle");
   refs.captureFeedback = el("capture-feedback");
+  refs.pendingCaptures = el("pending-captures");
+  refs.inboxLink = el("inbox-link");
 
   refs.migrationNotice = el("migration-notice");
   refs.pickThreeCard = el("pick-three-card");
@@ -55,6 +57,7 @@ export function init(handlers) {
   refs.unscheduledDrawer = el("unscheduled-drawer");
   refs.unscheduledFilter = el("unscheduled-filter");
   refs.unscheduledGroups = el("unscheduled-groups");
+  refs.inboxSection = el("inbox-section");
 
   refs.somedayList = el("someday-list");
 
@@ -134,6 +137,13 @@ export function renderSyncDot(status) {
   refs.syncDot.title = labels[status] || "Synced";
 }
 
+/** Opens the Week screen's "Not scheduled yet" drawer — used by the Today
+ * screen's "n new things to sort" link, which jumps you to Week and lands
+ * you straight on the Inbox section inside it. */
+export function openUnscheduledDrawer() {
+  if (refs.unscheduledDrawer) refs.unscheduledDrawer.open = true;
+}
+
 export function setActiveTab(tab) {
   for (const btn of refs.tabButtons) {
     const isActive = btn.dataset.tab === tab;
@@ -151,7 +161,9 @@ export function setActiveTab(tab) {
 
 function buildTaskRow(task, opts, handlers) {
   const li = document.createElement("li");
-  li.className = "task-row" + (task.status === "done" ? " is-done" : "");
+  li.className = "task-row" +
+    (task.status === "done" ? " is-done" : "") +
+    (opts.highlighted ? " task-row-new" : "");
   li.dataset.id = task.id;
 
   const check = document.createElement("button");
@@ -259,14 +271,18 @@ function attachSwipe(el, onDone) {
 export function renderToday(vm, handlers) {
   refs.migrationNotice.hidden = !vm.needsMigration;
 
+  renderCaptureFeedback(vm.pendingCaptures);
+  renderPendingCaptures(vm.pendingCaptures);
+  renderInboxLink(vm.inboxCount, handlers.onOpenInboxLink);
+
   clearChildren(refs.todayList);
   const rowHandlers = { onOpen: handlers.onOpenSheet, onToggleDone: handlers.onToggleDone, onSwipeDone: handlers.onToggleDone };
 
   for (const t of vm.scheduled) {
-    refs.todayList.appendChild(buildTaskRow(t, { showDueTag: false }, rowHandlers));
+    refs.todayList.appendChild(buildTaskRow(t, { showDueTag: false, highlighted: vm.highlightedIds.has(t.id) }, rowHandlers));
   }
   for (const t of vm.dueToday) {
-    refs.todayList.appendChild(buildTaskRow(t, { showDueTag: true }, rowHandlers));
+    refs.todayList.appendChild(buildTaskRow(t, { showDueTag: true, highlighted: vm.highlightedIds.has(t.id) }, rowHandlers));
   }
   if (!vm.scheduled.length && !vm.dueToday.length) {
     const empty = document.createElement("p");
@@ -277,6 +293,56 @@ export function renderToday(vm, handlers) {
 
   renderDoneToday(vm.doneToday, vm.doneTodayOpen, rowHandlers, handlers);
   renderPickThree(vm.pickThree, handlers);
+}
+
+/** The subtle "Sorting…" (or "Waiting for signal…") hint that lives right
+ * on the capture box, so it's obvious a ramble is still being worked on
+ * without needing to look away from where you just typed. */
+function renderCaptureFeedback(pendingCaptures) {
+  if (!refs.captureFeedback) return;
+  if (!pendingCaptures.length) {
+    refs.captureFeedback.textContent = "";
+    return;
+  }
+  const waiting = pendingCaptures.some(function (p) { return p.waiting; });
+  refs.captureFeedback.textContent = waiting ? "Waiting for signal…" : "Sorting…";
+}
+
+/** One row per capture still being sorted, at the top of Today. These come
+ * straight from the outgoing queue (see app.js's buildPendingCaptures), so
+ * a reload never loses one — it just keeps showing until the real response
+ * comes back (or, offline, until there's a signal to send it on). */
+function renderPendingCaptures(pendingCaptures) {
+  if (!refs.pendingCaptures) return;
+  clearChildren(refs.pendingCaptures);
+  for (const item of pendingCaptures) {
+    const row = document.createElement("div");
+    row.className = "pending-capture-row";
+    const dot = document.createElement("span");
+    dot.className = "pending-capture-dot";
+    dot.setAttribute("aria-hidden", "true");
+    row.appendChild(dot);
+    const text = document.createElement("span");
+    text.textContent = item.waiting ? "Waiting for signal…" : "Sorting: " + item.preview + "…";
+    row.appendChild(text);
+    refs.pendingCaptures.appendChild(row);
+  }
+}
+
+/** The quiet "n new things to sort" link — deliberately not styled as a
+ * warning or a backlog count (see docs/01-what-we-built-data-and-ui.md on
+ * why this app never does that). It's just new stuff, pointing at where it
+ * landed. */
+function renderInboxLink(count, onOpenInboxLink) {
+  if (!refs.inboxLink) return;
+  if (!count) {
+    refs.inboxLink.hidden = true;
+    refs.inboxLink.onclick = null;
+    return;
+  }
+  refs.inboxLink.hidden = false;
+  refs.inboxLink.textContent = count === 1 ? "1 new thing to sort" : count + " new things to sort";
+  refs.inboxLink.onclick = onOpenInboxLink;
 }
 
 function renderDoneToday(doneToday, isOpen, rowHandlers, handlers) {
@@ -391,6 +457,23 @@ export function renderWeek(vm, handlers) {
     }
     col.appendChild(list);
     refs.weekStrip.appendChild(col);
+  }
+
+  // Inbox — unsorted AI-fallback captures — always shown first and never
+  // affected by the filter box below, so a fresh capture never accidentally
+  // disappears because of whatever filter text was left over.
+  if (refs.inboxSection) {
+    clearChildren(refs.inboxSection);
+    if (vm.inbox && vm.inbox.length) {
+      const heading = document.createElement("h4");
+      heading.className = "category-heading inbox-heading";
+      heading.textContent = "Inbox";
+      refs.inboxSection.appendChild(heading);
+      const list = document.createElement("ul");
+      list.className = "task-list task-list-compact";
+      for (const t of vm.inbox) list.appendChild(buildTaskRow(t, { showDueTag: false }, rowHandlers));
+      refs.inboxSection.appendChild(list);
+    }
   }
 
   if (refs.unscheduledFilter.value !== vm.unscheduled.filterValue) {

@@ -17,6 +17,7 @@ import {
   unscheduledActiveTasks,
   filterTasksByText,
   groupByCategory,
+  inboxTasks,
   randomId,
 } from "../js/logic.js";
 
@@ -255,6 +256,15 @@ test("filterTasksByText matches title, notes or category, case-insensitively", (
 test("filterTasksByText with an empty query returns everything unchanged", () => {
   const tasks = [{ id: "1", title: "A" }];
   assert.deepEqual(filterTasksByText(tasks, ""), tasks);
+});
+
+test("inboxTasks returns only status:inbox tasks, oldest first", () => {
+  const tasks = [
+    { id: "1", status: "inbox", created_at: "2026-05-01T10:00:00.000Z" },
+    { id: "2", status: "active", created_at: "2026-05-01T09:00:00.000Z" },
+    { id: "3", status: "inbox", created_at: "2026-05-01T08:00:00.000Z" },
+  ];
+  assert.deepEqual(inboxTasks(tasks).map((t) => t.id), ["3", "1"]);
 });
 
 test("groupByCategory groups in fixed category order and drops empty ones", () => {

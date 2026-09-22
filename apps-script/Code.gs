@@ -12,11 +12,19 @@
  *
  * The OLD tab (whatever it's called) is never written to by this file. It
  * stays exactly as it is, as a backup, until you run `migrate()` by hand.
+ *
+ * Phase 4 adds `capture`: you type/paste a messy "brain-dump" and Gemini
+ * (a Google AI model) splits it into separate tasks for you, instead of
+ * you having to tidy it into one task per line yourself. The raw text is
+ * always logged to the Log tab BEFORE we even try calling Gemini, so a
+ * brain-dump can never be lost — and if Gemini is unreachable or sends
+ * back something we can't use, the whole thing is saved as one task in
+ * your Inbox instead of failing silently.
  */
 
 // Bump this whenever you deploy a meaningfully different version. `ping`
 // returns it, so the phone/browser can show you which code it's talking to.
-const CODE_VERSION = "0.2.0";
+const CODE_VERSION = "0.3.0";
 
 // ---------------------------------------------------------------------------
 // DATA MODEL CONSTANTS
@@ -73,6 +81,53 @@ const UPDATABLE_FIELDS = [
 const DONE_VISIBLE_DAYS = 7;
 
 // ---------------------------------------------------------------------------
+// GEMINI CAPTURE CONSTANTS (Phase 4)
+// ---------------------------------------------------------------------------
+
+// Which Gemini model to call. This is just a starting point — Google
+// renames/retires model names occasionally, so the GEMINI_MODEL Script
+// Property (if set) always wins over this default. See docs/RUNBOOK.md
+// section I.
+const GEMINI_MODEL_DEFAULT = "gemini-3.5-flash-lite";
+
+// A brain-dump longer than this is trimmed before it's sent anywhere. This
+// isn't really about Gemini's limits (it can handle far more) — it's a
+// sanity cap so a giant paste can't blow up the Log tab or the request.
+const GEMINI_MAX_RAW_CHARS = 4000;
+
+// However chatty someone's brain-dump is, we only ever ask for this many
+// tasks back. Keeps the list from turning into its own overwhelming wall
+// of text — the whole point of Phase 4 is to make things LESS overwhelming.
+const GEMINI_MAX_TASKS = 15;
+
+// The shape we force Gemini's reply into (via generationConfig.responseSchema
+// in callGemini_). Asking for structured JSON like this means we never have
+// to guess-parse free-form text — either the model gives us this shape, or
+// the call fails cleanly and we fall back (see doCapture).
+const GEMINI_RESPONSE_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    tasks: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          title: { type: "STRING" },
+          notes: { type: "STRING" },
+          category: { type: "STRING", enum: CATEGORIES },
+          est_min: { type: "INTEGER" },
+          do_date: { type: "STRING" },
+          due_date: { type: "STRING" },
+          due_time: { type: "STRING" },
+        },
+        required: ["title", "category"],
+      },
+    },
+  },
+  required: ["tasks"],
+};
+
+// ---------------------------------------------------------------------------
 // ROUTER
 // ---------------------------------------------------------------------------
 
@@ -87,6 +142,7 @@ const ACTIONS = {
   list_legacy: doListLegacy,
   add: doAdd,
   update: doUpdate,
+  capture: doCapture,
 };
 
 /**
@@ -312,6 +368,202 @@ function doUpdate(request) {
   }
 }
 
+/**
+ * Turns one messy "brain-dump" of text into one or more Tasks2 rows, using
+ * Gemini to do the splitting. This is the one action in the whole app that
+ * calls out to another service, so it's written defensively at every step:
+ *
+ *   1. The raw text is logged to the Log tab FIRST, before anything that
+ *      could possibly fail — so even a total Gemini/network outage never
+ *      loses what you typed.
+ *   2. The Gemini call happens OUTSIDE the script lock, because it can take
+ *      several seconds and we don't want every other request queued up
+ *      behind it.
+ *   3. If Gemini fails for ANY reason (down, bad key, sent back nonsense),
+ *      we don't show an error — we save the whole brain-dump as one task in
+ *      the Inbox instead, so nothing is ever lost, it just needs sorting.
+ *   4. op_id makes a retried request safe: if the app sends this exact
+ *      capture twice (e.g. the first response timed out but actually
+ *      succeeded), we just hand back what's already saved instead of
+ *      duplicating it.
+ */
+function doCapture(request) {
+  const payload = request.payload || {};
+  const rawInput = String(payload.raw || "").trim();
+  const opId = String(payload.op_id || "");
+  const nowIso = nowIso_();
+  const today = todayString_();
+
+  if (!rawInput) return { ok: false, error: "missing_text" };
+  const raw = rawInput.slice(0, GEMINI_MAX_RAW_CHARS);
+
+  const ss = getSpreadsheet_();
+  const tasks2 = ensureTabs_(ss);
+  const tasks2Headers = getHeaders_(tasks2);
+
+  const existing = findTasksByOpId_(tasks2, tasks2Headers, opId);
+  if (existing.length) {
+    const dupSource = existing[0].source === "fallback" ? "fallback" : "ai";
+    return { ok: true, tasks: existing, source: dupSource, duplicate: true };
+  }
+
+  const logSheet = ss.getSheetByName(LOG_SHEET_NAME);
+  const logHeaders = getHeaders_(logSheet);
+  const logRow = appendLogRow_(logSheet, logHeaders, nowIso, "capture", raw, "pending");
+
+  let geminiTasks = null;
+  let failureReason = "";
+  try {
+    geminiTasks = callGemini_(raw, today);
+  } catch (err) {
+    failureReason = errorMessage_(err);
+  }
+
+  let rows;
+  let source;
+  if (geminiTasks && geminiTasks.length) {
+    source = "ai";
+    rows = geminiTasks.map(function (t) {
+      const validated = validateNewTask_(
+        Object.assign({}, t, { id: Utilities.getUuid(), status: "active", source: "ai", raw_input: raw }),
+        nowIso
+      );
+      // Every field here already came out of parseGeminiTasks_ clean, so
+      // validateNewTask_ should never reject it — but if it ever does
+      // (e.g. a title that somehow ended up empty), fall back to the
+      // whole-brain-dump-as-one-task safety net rather than losing it.
+      return validated.ok ? validated.row : null;
+    }).filter(function (row) { return row !== null; });
+    if (rows.length === 0) {
+      source = "fallback";
+      failureReason = failureReason || "gemini_rows_failed_validation";
+      rows = [buildFallbackTask_(raw, Utilities.getUuid(), nowIso)];
+    }
+  } else {
+    source = "fallback";
+    failureReason = failureReason || "no_tasks_returned";
+    rows = [buildFallbackTask_(raw, Utilities.getUuid(), nowIso)];
+  }
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  let savedTasks;
+  try {
+    const sheet = ensureTabs_(ss);
+    const headers = getHeaders_(sheet);
+    const values = rows.map(function (row) {
+      row.op_id = opId;
+      return taskToRowValues_(headers, row);
+    });
+    sheet.getRange(sheet.getLastRow() + 1, 1, values.length, headers.length).setValues(values);
+    savedTasks = values.map(function (rowValues) { return rowToTask_(headers, rowValues); });
+  } finally {
+    lock.releaseLock();
+  }
+
+  const resultText = source === "ai" ? "ok:" + savedTasks.length + " tasks" : "fallback: " + failureReason;
+  updateLogResult_(logSheet, logHeaders, logRow, resultText);
+
+  const response = { ok: true, tasks: savedTasks, source: source };
+  if (source === "fallback") response.reason = failureReason;
+  return response;
+}
+
+// ---------------------------------------------------------------------------
+// AI CAPTURE HELPERS (Phase 4) — sheet/network access, not pure
+// ---------------------------------------------------------------------------
+
+/**
+ * Calls Gemini with one brain-dump and returns the parsed task list (see
+ * parseGeminiTasks_). Throws a short, readable error on any failure — a
+ * missing key, a non-200 response, or a reply we can't make sense of —
+ * which doCapture catches and turns into the one-task fallback.
+ */
+function callGemini_(raw, todayStr) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  if (!apiKey) throw new Error("missing_gemini_key");
+
+  const model = PropertiesService.getScriptProperties().getProperty("GEMINI_MODEL") || GEMINI_MODEL_DEFAULT;
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent";
+  const prompt = buildGeminiPrompt_(raw, todayStr);
+
+  const requestBody = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: GEMINI_RESPONSE_SCHEMA,
+      temperature: 0.2,
+    },
+  };
+
+  const response = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    headers: { "x-goog-api-key": apiKey },
+    payload: JSON.stringify(requestBody),
+    muteHttpExceptions: true, // so a Gemini error comes back as text we can read, not a thrown exception with no detail
+  });
+
+  const status = response.getResponseCode();
+  if (status !== 200) {
+    throw new Error("gemini_http_" + status + ": " + response.getContentText().slice(0, 200));
+  }
+
+  let envelope;
+  try {
+    envelope = JSON.parse(response.getContentText());
+  } catch (err) {
+    throw new Error("gemini_bad_json_envelope");
+  }
+
+  const text = envelope && envelope.candidates && envelope.candidates[0] &&
+    envelope.candidates[0].content && envelope.candidates[0].content.parts &&
+    envelope.candidates[0].content.parts[0] && envelope.candidates[0].content.parts[0].text;
+  if (!text) throw new Error("gemini_no_text_in_response");
+
+  return parseGeminiTasks_(text);
+}
+
+/** Appends one row to the Log tab and returns its 1-based sheet row number,
+ * so the caller can come back later and fill in the `result` column. */
+function appendLogRow_(sheet, headers, at, source, rawText, result) {
+  const row = headers.map(function (h) {
+    if (h === "at") return at;
+    if (h === "source") return source;
+    if (h === "raw_text") return rawText;
+    if (h === "result") return result;
+    return "";
+  });
+  sheet.appendRow(row);
+  return sheet.getLastRow();
+}
+
+/** Fills in the `result` column of a Log row written earlier by appendLogRow_. */
+function updateLogResult_(sheet, headers, rowNum, result) {
+  const resultCol = headers.indexOf("result");
+  if (resultCol === -1) return;
+  sheet.getRange(rowNum, resultCol + 1).setValue(result);
+}
+
+/**
+ * Looks for Tasks2 rows that already carry this op_id — the idempotency
+ * check that makes a retried `capture` request safe. An empty op_id never
+ * matches anything (it would otherwise match every never-retried row).
+ */
+function findTasksByOpId_(sheet, headers, opId) {
+  if (!opId) return [];
+  const opIdCol = headers.indexOf("op_id");
+  const lastRow = sheet.getLastRow();
+  if (opIdCol === -1 || lastRow < 2) return [];
+
+  const values = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  const matches = [];
+  for (let i = 0; i < values.length; i++) {
+    if (String(values[i][opIdCol] || "") === opId) matches.push(rowToTask_(headers, values[i]));
+  }
+  return matches;
+}
+
 // ---------------------------------------------------------------------------
 // PURE VALIDATION / MUTATION FUNCTIONS
 // (no sheet access — this is what runTests() exercises directly)
@@ -473,6 +725,126 @@ function validEstMin_(v) {
   const n = Number(v);
   if (isNaN(n) || n < 0) return "";
   return n;
+}
+
+// --- Gemini capture (Phase 4) — pure helpers ------------------------------
+// These two functions are deliberately kept free of any Apps Script-only
+// API (no Utilities, no SpreadsheetApp) so they can be copied into a plain
+// .mjs file and run under plain `node` — see the verification steps in the
+// PR/commit that added this comment for how that's done by hand.
+
+/**
+ * Builds the single text prompt sent to Gemini: today's date (so "Friday"
+ * or "next week" can be resolved to a real YYYY-MM-DD), and instructions
+ * for how to split a ramble into tasks. Pure — given the same raw text and
+ * date, it always returns the same prompt, which is what makes it testable
+ * without actually calling Gemini.
+ */
+function buildGeminiPrompt_(raw, todayStr) {
+  const parts = String(todayStr).split("-").map(Number);
+  const weekdayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const weekday = weekdayNames[new Date(parts[0], parts[1] - 1, parts[2]).getDay()];
+
+  return (
+    "Today's date is " + todayStr + " (" + weekday + "), timezone Europe/London.\n\n" +
+    "Split this brain-dump into separate, concrete, actionable tasks (max " + GEMINI_MAX_TASKS + "). " +
+    "Keep the person's own words for titles, short (≤80 chars), imperative. " +
+    "Put extra detail in notes. Estimate minutes realistically (5–120). " +
+    "Resolve relative dates ('Friday', 'next week', 'end of month', 'tomorrow') to YYYY-MM-DD using " +
+    "today's date; use due_date for deadlines, do_date only when they say when they'll DO it; leave " +
+    "blank when unsure. due_time HH:mm only if a time is given. Category from the list; Inbox if " +
+    "unclear. Do not invent tasks; a note or feeling that isn't a task can be dropped.\n\n" +
+    "Categories: " + CATEGORIES.join(", ") + "\n\n" +
+    "Brain-dump:\n" + raw
+  );
+}
+
+/**
+ * Turns Gemini's raw JSON text reply into a clean array of task-ish objects
+ * (title/notes/category/est_min/do_date/due_date/due_time — NOT full Tasks2
+ * rows yet, that's doCapture's job). Throws a short error for anything
+ * unusable: not JSON, not the shape we asked for, or zero tasks left once
+ * blank titles are dropped — doCapture treats any throw here as "Gemini
+ * failed" and falls back to saving the whole brain-dump as one task.
+ */
+function parseGeminiTasks_(jsonText) {
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (err) {
+    throw new Error("gemini_bad_json: " + (err && err.message ? err.message : String(err)));
+  }
+  if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.tasks)) {
+    throw new Error("gemini_bad_shape");
+  }
+
+  const tasks = [];
+  for (let i = 0; i < parsed.tasks.length && tasks.length < GEMINI_MAX_TASKS; i++) {
+    const t = parsed.tasks[i];
+    if (!t || typeof t !== "object") continue;
+
+    const title = String(t.title || "").trim().slice(0, 80);
+    if (!title) continue; // no usable title — not something we can call a task
+
+    tasks.push({
+      title: title,
+      notes: t.notes ? String(t.notes) : "",
+      category: CATEGORIES.indexOf(t.category) !== -1 ? t.category : "Inbox",
+      est_min: clampEstMin_(t.est_min),
+      do_date: validDate_(t.do_date) ? t.do_date : "",
+      due_date: validDate_(t.due_date) ? t.due_date : "",
+      due_time: validTime_(t.due_time) ? t.due_time : "",
+    });
+  }
+
+  if (tasks.length === 0) throw new Error("gemini_zero_usable_tasks");
+  return tasks;
+}
+
+/**
+ * Like validEstMin_, but also clamps into the 5–120 minute range Gemini was
+ * asked for — a blank estimate stays blank (that's "unsure", not "zero"),
+ * but a wild number like 5000 gets pulled back into something realistic
+ * instead of just being accepted as-is.
+ */
+function clampEstMin_(v) {
+  if (v === undefined || v === null || v === "") return "";
+  const n = Number(v);
+  if (isNaN(n)) return "";
+  return Math.max(5, Math.min(120, Math.round(n)));
+}
+
+/**
+ * Builds the "Gemini didn't work out" fallback: the WHOLE brain-dump saved
+ * as one task, title-only from its first line, so nothing is ever lost —
+ * it just needs manual sorting later. Pure (id and nowIso are passed in
+ * rather than generated here) so it can be unit-tested directly.
+ */
+function buildFallbackTask_(raw, id, nowIso) {
+  const rawStr = String(raw || "");
+  const firstLine = rawStr.split("\n")[0].trim() || rawStr.trim();
+  const title = firstLine.length > 80 ? firstLine.slice(0, 80) + "…" : (firstLine || "Untitled capture");
+
+  return {
+    id: id,
+    title: title,
+    notes: rawStr,
+    category: "Inbox",
+    est_min: "",
+    status: "inbox",
+    do_date: "",
+    due_date: "",
+    due_time: "",
+    sort: "",
+    created_at: nowIso,
+    updated_at: nowIso,
+    completed_at: "",
+    last_touched_at: nowIso,
+    calendar_event_id: "",
+    source: "fallback",
+    raw_input: rawStr,
+    op_id: "", // filled in by doCapture from the top-level payload
+  };
 }
 
 /**
@@ -899,6 +1271,30 @@ function rotateDeviceKey() {
 }
 
 /**
+ * Run this by hand (function dropdown → `test_gemini` → Run) any time you
+ * want to check the GEMINI_API_KEY Script Property actually works, without
+ * going through the app. Logs the tasks Gemini split a sample ramble into,
+ * or the raw error if the call failed — see docs/RUNBOOK.md section I.
+ */
+function test_gemini() {
+  const sampleRaw =
+    "need to book the dentist for a check up sometime next week, also must " +
+    "pay the electric bill by friday, keep forgetting to call mum back, and " +
+    "pick up milk on the way home today";
+
+  Logger.log("Calling Gemini with a sample brain-dump...");
+  try {
+    const tasks = callGemini_(sampleRaw, todayString_());
+    Logger.log("Success — Gemini split it into " + tasks.length + " task(s):");
+    Logger.log(JSON.stringify(tasks, null, 2));
+  } catch (err) {
+    Logger.log("callGemini_ failed. Check GEMINI_API_KEY (and GEMINI_MODEL, if set) " +
+      "in Project Settings > Script Properties. Raw error:");
+    Logger.log(errorMessage_(err));
+  }
+}
+
+/**
  * Two UUIDs joined together (dashes removed) gives a 64-character
  * hex-ish string — long and random enough that guessing it is not a
  * realistic attack, without needing any special crypto library.
@@ -960,6 +1356,18 @@ function runTests() {
   test_validDate_rejectsJunk_(results);
   test_validTime_acceptsHhMm_(results);
   test_validEstMin_rejectsNegative_(results);
+
+  test_buildGeminiPrompt_includesTodayAndCategories_(results);
+  test_parseGeminiTasks_happyPath_(results);
+  test_parseGeminiTasks_rejectsJunk_(results);
+  test_parseGeminiTasks_rejectsMissingTasksArray_(results);
+  test_parseGeminiTasks_dropsBlankTitles_(results);
+  test_parseGeminiTasks_capsAt15_(results);
+  test_parseGeminiTasks_zeroUsableTasksThrows_(results);
+  test_clampEstMin_clampsIntoRange_(results);
+  test_clampEstMin_blankStaysBlank_(results);
+  test_buildFallbackTask_usesFirstLineAsTitle_(results);
+  test_buildFallbackTask_truncatesLongFirstLine_(results);
 
   const failed = results.filter(function (r) { return !r.pass; });
   Logger.log(results.map(function (r) {
@@ -1233,4 +1641,81 @@ function test_validTime_acceptsHhMm_(results) {
 
 function test_validEstMin_rejectsNegative_(results) {
   assert_(results, "validEstMin_ blanks a negative number", validEstMin_(-5) === "");
+}
+
+// --- Gemini capture (Phase 4) ---------------------------------------------
+
+function test_buildGeminiPrompt_includesTodayAndCategories_(results) {
+  const prompt = buildGeminiPrompt_("buy milk", "2026-03-05");
+  assert_(results, "buildGeminiPrompt_ mentions today's date and the category list",
+    prompt.indexOf("2026-03-05") !== -1 && prompt.indexOf("Career & Learning") !== -1);
+}
+
+function test_parseGeminiTasks_happyPath_(results) {
+  const json = JSON.stringify({ tasks: [
+    { title: "Book dentist", category: "Health & Personal Care", est_min: 15, due_date: "2026-03-10" },
+  ] });
+  const tasks = parseGeminiTasks_(json);
+  assert_(results, "parseGeminiTasks_ parses a well-formed response",
+    tasks.length === 1 && tasks[0].title === "Book dentist" &&
+    tasks[0].category === "Health & Personal Care" && tasks[0].due_date === "2026-03-10");
+}
+
+function test_parseGeminiTasks_rejectsJunk_(results) {
+  let threw = false;
+  try { parseGeminiTasks_("not json at all"); } catch (err) { threw = true; }
+  assert_(results, "parseGeminiTasks_ throws on unparseable text", threw === true);
+}
+
+function test_parseGeminiTasks_rejectsMissingTasksArray_(results) {
+  let threw = false;
+  try { parseGeminiTasks_(JSON.stringify({ notTasks: [] })); } catch (err) { threw = true; }
+  assert_(results, "parseGeminiTasks_ throws when there's no tasks array", threw === true);
+}
+
+function test_parseGeminiTasks_dropsBlankTitles_(results) {
+  const json = JSON.stringify({ tasks: [
+    { title: "   ", category: "Inbox" },
+    { title: "Real task", category: "Inbox" },
+  ] });
+  const tasks = parseGeminiTasks_(json);
+  assert_(results, "parseGeminiTasks_ drops a task with a blank title",
+    tasks.length === 1 && tasks[0].title === "Real task");
+}
+
+function test_parseGeminiTasks_capsAt15_(results) {
+  const many = [];
+  for (let i = 0; i < 20; i++) many.push({ title: "Task " + i, category: "Inbox" });
+  const tasks = parseGeminiTasks_(JSON.stringify({ tasks: many }));
+  assert_(results, "parseGeminiTasks_ never returns more than 15 tasks", tasks.length === 15);
+}
+
+function test_parseGeminiTasks_zeroUsableTasksThrows_(results) {
+  let threw = false;
+  try { parseGeminiTasks_(JSON.stringify({ tasks: [{ title: "" }] })); } catch (err) { threw = true; }
+  assert_(results, "parseGeminiTasks_ throws when every task has a blank title", threw === true);
+}
+
+function test_clampEstMin_clampsIntoRange_(results) {
+  assert_(results, "clampEstMin_ clamps a huge estimate down to 120", clampEstMin_(500) === 120);
+  assert_(results, "clampEstMin_ clamps a tiny estimate up to 5", clampEstMin_(1) === 5);
+}
+
+function test_clampEstMin_blankStaysBlank_(results) {
+  assert_(results, "clampEstMin_ leaves a missing estimate blank", clampEstMin_("") === "");
+}
+
+function test_buildFallbackTask_usesFirstLineAsTitle_(results) {
+  const row = buildFallbackTask_("Call the vet about Rex\nand check his food", "id-1", "2026-01-01T00:00:00.000Z");
+  assert_(results, "buildFallbackTask_ uses the first line as the title, keeps the full text in notes",
+    row.title === "Call the vet about Rex" &&
+    row.notes === "Call the vet about Rex\nand check his food" &&
+    row.status === "inbox" && row.category === "Inbox" && row.source === "fallback");
+}
+
+function test_buildFallbackTask_truncatesLongFirstLine_(results) {
+  const longLine = new Array(101).join("x"); // 100 chars, no newline
+  const row = buildFallbackTask_(longLine, "id-2", "2026-01-01T00:00:00.000Z");
+  assert_(results, "buildFallbackTask_ truncates an overlong first line to 80 chars + an ellipsis",
+    row.title.length === 81 && row.title.slice(-1) === "…");
 }
