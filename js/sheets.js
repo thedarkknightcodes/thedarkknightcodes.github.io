@@ -151,6 +151,18 @@ function openEditForm(task, handlers) {
   dueTimeInput.value = task.due_time || "";
   form.appendChild(labeledField("Due time", dueTimeInput));
 
+  // Phase 6: a due date is what gets a task a real calendar reminder (see
+  // syncTaskEvent_ in Code.gs) — this quiet hint just says so, updating
+  // live as you add or clear the date, so it's never a surprise later.
+  const reminderHint = document.createElement("p");
+  reminderHint.className = "field-hint";
+  reminderHint.textContent = "A reminder goes in your Tasks calendar.";
+  reminderHint.hidden = !dueDateInput.value;
+  form.appendChild(reminderHint);
+  dueDateInput.addEventListener("input", function () {
+    reminderHint.hidden = !dueDateInput.value;
+  });
+
   const buttons = document.createElement("div");
   buttons.className = "sheet-actions";
   const saveBtn = document.createElement("button");
@@ -219,6 +231,12 @@ export function openSettingsSheet(info, handlers) {
   dialog.appendChild(timeLine);
   settingsInfoRefs = { versionLine: versionLine, timeLine: timeLine };
   updateSettingsInfo(info);
+
+  // Phase 6: static text, no new API call — just says where reminders go.
+  const remindersLine = document.createElement("p");
+  remindersLine.className = "settings-line";
+  remindersLine.textContent = "Reminders: events go into your \"Tasks\" Google Calendar";
+  dialog.appendChild(remindersLine);
 
   const actions = document.createElement("div");
   actions.className = "sheet-actions";

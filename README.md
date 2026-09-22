@@ -11,7 +11,22 @@ security and reliability problems (see `docs/00-what-we-built-security.md`
 for the first one fixed). It's being replaced a phase at a time, with each
 phase actually used for a while before the next one starts.
 
-## Current status: Phase 4 — AI brain-dump capture
+## Current status: Phase 6 — reminders + nightly tidy + morning digest
+
+Phase 6 adds real calendar reminders: every task with a due date gets an
+event (with a popup notification) in its own "Tasks" Google Calendar,
+never your main one. A nightly job quietly unschedules anything left on a
+day that's passed and fades long-untouched tasks to Someday — nothing is
+ever deleted — then rebuilds one calm 07:30 "here's today" digest event
+instead of a pile of separate reminders. See
+`docs/04-what-we-built-share-and-reminders.md` for what changed and why,
+and `docs/RUNBOOK.md` section K for how to turn it on.
+
+Phase 5 made the app a **share target** on Android: once installed, you
+can share text straight into it from any app (Chrome, Keep, a voice
+recorder, whatever) instead of having to open the app and retype it. See
+`docs/04-what-we-built-share-and-reminders.md` and `docs/RUNBOOK.md`
+section J.
 
 Phase 4 turns the capture box into a "brain-dump" box: type or paste a
 messy ramble, and Gemini (a Google AI model) splits it into separate,
@@ -65,6 +80,8 @@ this repo, with the person driving the rebuild).
 | `docs/00-what-we-built-security.md` | Plain-English explanation of what Phase 0 fixed and why. |
 | `docs/01-what-we-built-data-and-ui.md` | Plain-English explanation of what Phase 2 built and why. |
 | `docs/02-what-we-built-pwa.md` | Plain-English explanation of what Phase 3 built and why. |
+| `docs/03-what-we-built-ai-capture.md` | Plain-English explanation of what Phase 4 built and why. |
+| `docs/04-what-we-built-share-and-reminders.md` | Plain-English explanation of what Phases 5 and 6 built and why. |
 
 ## Getting started
 

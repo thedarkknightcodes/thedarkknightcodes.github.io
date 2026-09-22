@@ -282,3 +282,110 @@ limits and its terms note that free-tier prompts may be used to improve
 Google's models. If that matters to you, read Google AI Studio's current
 terms before relying on this for anything sensitive — a paid tier removes
 both concerns.
+
+---
+
+## J. Phase 5: share from any Android app
+
+As of this phase, the app can be the *target* of Android's normal Share
+button — from any app, not just a browser. This only works once the app is
+**installed** (see section H) — a share target has to be registered with
+the phone, and that registration is part of installing the app, not
+something a plain browser tab offers.
+
+**If the app was already installed before this phase shipped:** Android
+read the share-target setup from `manifest.webmanifest` at install time, so
+an older install won't know about it. Remove it from your home screen and
+add it again (same as the "if you change the manifest or icons" note in
+section H) — that's what makes Android re-read the manifest.
+
+1. Ship the latest code (frontend files + `apps-script/Code.gs` — section
+   C) so `share_target` in the manifest and the share-handling code in
+   `js/app.js` are both live.
+2. On your Pixel: if Task Planner is already installed, remove it from the
+   home screen, then reinstall it (section H). If it isn't installed yet,
+   just install it fresh — you're already covered.
+3. Try it from a few different apps, since they don't all fill in the same
+   fields:
+   - **Chrome:** open any page → **Share** → **Task Planner**. Usually
+     shares the page title and its URL.
+   - **Google Keep:** open a note → **⋮** → **Send** → **Task Planner**.
+   - **A voice recorder / transcription app (e.g. Rambler)**, or any notes
+     app: share its text the same way.
+   - **Recorder** (Pixel's built-in one): share a transcript.
+4. Each time, the app should open straight to Today, show a brief "Got it
+   ✓" toast, and a "Sorting…" row while it's being split into tasks — the
+   exact same feeling as typing something into the capture box yourself.
+5. Check the address bar (or Settings → app info, if you want to be
+   thorough) afterwards — the `?title=...&text=...` should be gone from the
+   URL. If you reload the page right after sharing, nothing should be
+   captured a second time.
+
+**iPad:** iOS/iPadOS has no share-target support for web apps at all — this
+is an Android-only feature. On iPad, just use dictation (the microphone key
+on the keyboard) straight into the capture box instead; it gets you to the
+same place.
+
+---
+
+## K. Phase 6: reminders + nightly tidy + morning digest
+
+This turns due dates into real notifications: every dated task gets an
+event (with a popup reminder) in its own **"Tasks"** Google Calendar — a
+separate calendar this app creates and manages, never your main one. Once a
+day it also quietly tidies up (nothing is ever deleted — see
+`docs/04-what-we-built-share-and-reminders.md`), and rebuilds a single
+07:30 "here's today" event each morning.
+
+1. Replace the contents of `Code.gs` with the latest
+   `apps-script/Code.gs` from this repo (section C), and do the same for
+   `appsscript.json` (it now lists the extra permissions this phase needs —
+   see step 6 in section A for how to open/replace that file), and save.
+2. Function dropdown → **`runTests`** → **Run**. Should end with "All …
+   tests passed" (all local checks — no Calendar access yet).
+3. Function dropdown → **`installTriggers`** → **Run**. This is the first
+   time the script touches Google Calendar, so you'll likely be asked to
+   **re-authorise** it (same click-through as section A, step 10 — this
+   time for the added Calendar/trigger permissions). Check the Execution
+   log: "Installed the nightly tidy trigger…".
+4. Function dropdown → **`resync_calendar`** → **Run**. This creates
+   calendar events for every dated task you already have (so Phase 6
+   doesn't only apply to tasks you add from now on). Check the log for how
+   many rows it checked/changed.
+5. Function dropdown → **`nightlyTidy`** → **Run**. This runs the whole
+   nightly job once, by hand, right now — check the log for what it did,
+   then open your Google Calendar and look for a **"Today: …"** event at
+   07:30 in the **Tasks** calendar. That's the digest.
+6. Ship it: **Deploy → Manage deployments → pencil icon → Version: New
+   version → Deploy** (section C — same URL, no config change).
+7. Open the app, click **Ping** in Settings → version should now read
+   `0.4.0`.
+8. On your **Pixel** and **iPad**, open the Google Calendar app and check:
+   - The **Tasks** calendar is ticked visible (Settings → your account →
+     make sure "Tasks" isn't hidden).
+   - Notifications are turned on for it (Google Calendar app → Settings →
+     Tasks calendar → make sure event notifications aren't muted).
+
+**Changing the fade window (how long an untouched task waits before
+quietly moving to Someday):** edit the `FADE_DAYS` constant near the top of
+`Code.gs` (it's currently `21`), then ship the change (section C). No other
+setting needs to change — `planNightlyTidy_` and its tests all read from
+this one constant.
+
+**Changing the digest time:** the 07:30–07:40 event time is set in
+`buildDigestEvent_` (look for `parseDateTime_(today, "07:30")` and
+`"07:40"`). Edit those two strings (24-hour `HH:mm`), ship the change. The
+*trigger* that runs the nightly tidy itself (which is what rebuilds the
+digest) is separate — see the next paragraph if you also want to move that.
+
+**Changing when the nightly tidy runs:** it's currently `atHour(3)` in
+`installTriggers()` (see that function's comment for why it's "roughly
+3am", not exactly). To change it, edit that number, then run
+**`installTriggers`** again from the editor — it always removes the old
+trigger first, so this is safe to re-run any time. **`removeTriggers`**
+turns the whole nightly job off if you ever want to pause it.
+
+**A note on `TASKS_CALENDAR_ID` and `DIGEST_EVENT_ID`:** these are Script
+Properties the code manages for you automatically (same idea as
+`DEVICE_KEY` — Project Settings → Script Properties, if you're curious).
+You shouldn't normally need to touch them by hand.

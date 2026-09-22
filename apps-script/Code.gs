@@ -20,11 +20,26 @@
  * brain-dump can never be lost — and if Gemini is unreachable or sends
  * back something we can't use, the whole thing is saved as one task in
  * your Inbox instead of failing silently.
+ *
+ * Phase 6 adds reminders and an automatic nightly tidy. Every task with a
+ * due date gets a real event (with a popup notification) in its own
+ * "Tasks" Google Calendar, never your main calendar, so a deadline can
+ * actually reach you instead of only living inside the app. Once a day, a
+ * time-based trigger quietly unschedules anything you didn't get to and
+ * fades anything untouched for weeks into Someday (never deleted, never
+ * scolded — see planNightlyTidy_'s comment), then rebuilds one calm 07:30
+ * "here's today" event instead of a wall of separate reminders. A
+ * calendar hiccup of any kind must never stop a task from saving — see
+ * syncTaskEvent_'s comment for how that's guaranteed.
  */
 
 // Bump this whenever you deploy a meaningfully different version. `ping`
 // returns it, so the phone/browser can show you which code it's talking to.
-const CODE_VERSION = "0.3.0";
+const CODE_VERSION = "0.4.0";
+
+// The app's own URL, used in calendar event descriptions ("Open: ...") so
+// a reminder always has a one-tap way back into the app.
+const APP_URL = "https://thedarkknightcodes.github.io/";
 
 // ---------------------------------------------------------------------------
 // DATA MODEL CONSTANTS
@@ -79,6 +94,12 @@ const UPDATABLE_FIELDS = [
 // still see "done today" style feedback for a bit — then it quietly drops
 // out instead of piling up forever.
 const DONE_VISIBLE_DAYS = 7;
+
+// How many days of no activity (no edit, no touch of any kind) before
+// nightlyTidy() quietly moves a task to Someday. See planNightlyTidy_'s
+// comment for the full rule — this is a fade, not a deletion, and nothing
+// about it is ever shown as a countdown or a warning.
+const FADE_DAYS = 21;
 
 // ---------------------------------------------------------------------------
 // GEMINI CAPTURE CONSTANTS (Phase 4)
@@ -143,6 +164,7 @@ const ACTIONS = {
   add: doAdd,
   update: doUpdate,
   capture: doCapture,
+  digest_preview: doDigestPreview,
 };
 
 /**
@@ -281,6 +303,26 @@ function findLegacySheet_(ss) {
   return null;
 }
 
+/**
+ * Returns what the 07:30 digest event would say right now, without
+ * touching Calendar at all — handy for checking buildDigestText_'s output
+ * from a spike page or a quick manual test, without waiting for the
+ * nightly trigger or creating a real event.
+ */
+function doDigestPreview(request) {
+  const ss = getSpreadsheet_();
+  const sheet = ensureTabs_(ss);
+  const headers = getHeaders_(sheet);
+  const lastRow = sheet.getLastRow();
+  const tasks = lastRow < 2
+    ? []
+    : rowsToTasks_(headers, sheet.getRange(2, 1, lastRow - 1, headers.length).getValues());
+
+  const today = todayString_();
+  const text = buildDigestText_(tasks, today);
+  return { ok: true, today: today, title: text.title, description: text.description };
+}
+
 // ---------------------------------------------------------------------------
 // ACTIONS — writes
 // ---------------------------------------------------------------------------
@@ -321,8 +363,14 @@ function doAdd(request) {
     row.op_id = String(payload.op_id || "");
     const values = taskToRowValues_(headers, row);
     sheet.appendRow(values);
+    const rowNum = sheet.getLastRow();
 
-    return { ok: true, task: rowToTask_(headers, values) };
+    // Calendar sync happens AFTER the row is safely saved — see
+    // syncTaskEvent_'s comment for why a Calendar failure here can never
+    // undo or block the save that just happened above.
+    row.calendar_event_id = syncTaskEvent_(sheet, headers, rowNum, row);
+
+    return { ok: true, task: rowToTask_(headers, taskToRowValues_(headers, row)) };
   } finally {
     lock.releaseLock();
   }
@@ -362,7 +410,11 @@ function doUpdate(request) {
     const newValues = taskToRowValues_(headers, result.task);
     sheet.getRange(rowNum, 1, 1, headers.length).setValues([newValues]);
 
-    return { ok: true, task: rowToTask_(headers, newValues) };
+    // Same rule as doAdd: sync the calendar only after the sheet write has
+    // already succeeded, and never let a Calendar problem undo it.
+    result.task.calendar_event_id = syncTaskEvent_(sheet, headers, rowNum, result.task);
+
+    return { ok: true, task: rowToTask_(headers, taskToRowValues_(headers, result.task)) };
   } finally {
     lock.releaseLock();
   }
@@ -391,6 +443,12 @@ function doCapture(request) {
   const payload = request.payload || {};
   const rawInput = String(payload.raw || "").trim();
   const opId = String(payload.op_id || "");
+  // Phase 5: the app sends "share" when this capture came in through
+  // Android's share sheet rather than the capture box, purely so the Log
+  // tab can tell the two apart later. It changes nothing else — the same
+  // Gemini call, the same ai/fallback rules, the same raw_input. Anything
+  // other than exactly "share" is treated as the ordinary typed case.
+  const sourceHint = payload.source_hint === "share" ? "share" : "typed";
   const nowIso = nowIso_();
   const today = todayString_();
 
@@ -409,7 +467,7 @@ function doCapture(request) {
 
   const logSheet = ss.getSheetByName(LOG_SHEET_NAME);
   const logHeaders = getHeaders_(logSheet);
-  const logRow = appendLogRow_(logSheet, logHeaders, nowIso, "capture", raw, "pending");
+  const logRow = appendLogRow_(logSheet, logHeaders, nowIso, "capture:" + sourceHint, raw, "pending");
 
   let geminiTasks = null;
   let failureReason = "";
@@ -455,8 +513,16 @@ function doCapture(request) {
       row.op_id = opId;
       return taskToRowValues_(headers, row);
     });
-    sheet.getRange(sheet.getLastRow() + 1, 1, values.length, headers.length).setValues(values);
-    savedTasks = values.map(function (rowValues) { return rowToTask_(headers, rowValues); });
+    const startRow = sheet.getLastRow() + 1;
+    sheet.getRange(startRow, 1, values.length, headers.length).setValues(values);
+
+    // One calendar sync per new task, same "after the sheet write, never
+    // lets Calendar block the save" rule as doAdd/doUpdate.
+    savedTasks = values.map(function (rowValues, i) {
+      const task = rowToTask_(headers, rowValues);
+      task.calendar_event_id = syncTaskEvent_(sheet, headers, startRow + i, task);
+      return task;
+    });
   } finally {
     lock.releaseLock();
   }
@@ -562,6 +628,437 @@ function findTasksByOpId_(sheet, headers, opId) {
     if (String(values[i][opIdCol] || "") === opId) matches.push(rowToTask_(headers, values[i]));
   }
   return matches;
+}
+
+// ---------------------------------------------------------------------------
+// CALENDAR REMINDERS (Phase 6)
+// ---------------------------------------------------------------------------
+
+/**
+ * Finds the dedicated "Tasks" Google Calendar this app uses for reminders,
+ * creating it once (the first time any task needs an event) if it doesn't
+ * exist yet. The calendar's id is remembered in the Script Property
+ * TASKS_CALENDAR_ID so we always find the SAME calendar again — this app
+ * only ever reads or writes events inside that one calendar, never your
+ * main "Home"/personal calendar.
+ */
+function getTasksCalendar_() {
+  const props = PropertiesService.getScriptProperties();
+  const existingId = props.getProperty("TASKS_CALENDAR_ID");
+
+  if (existingId) {
+    const existing = CalendarApp.getCalendarById(existingId);
+    if (existing) return existing;
+    // The id we had saved doesn't resolve to a real calendar any more
+    // (e.g. it was deleted by hand in Google Calendar) — fall through and
+    // make a fresh one rather than throwing.
+  }
+
+  const created = CalendarApp.createCalendar("Tasks");
+  props.setProperty("TASKS_CALENDAR_ID", created.getId());
+  return created;
+}
+
+/**
+ * PURE: decides whether a task should currently have a calendar reminder,
+ * and if so what it should say. No CalendarApp access here at all — that's
+ * what makes this the part runTests() can actually check, since the
+ * Calendar-touching half (syncTaskEvent_) needs a real Apps Script project
+ * to run against.
+ *
+ * Only an open task (active or inbox — i.e. not done/dropped/someday) with
+ * a due_date wants an event. do_date alone ("I plan to do this on...")
+ * never creates a calendar event — only a real due_date does, because a
+ * calendar reminder is for something with an actual deadline, not every
+ * plan.
+ */
+function desiredEventState_(task) {
+  const isOpenStatus = task && (task.status === "active" || task.status === "inbox");
+  if (!isOpenStatus || !task.due_date) return null;
+
+  return {
+    title: String(task.title || ""),
+    dueDate: task.due_date,
+    dueTime: task.due_time || "",
+    description: String(task.notes || "") + "\n\nOpen: " + APP_URL,
+  };
+}
+
+/**
+ * Makes one task's calendar event match desiredEventState_'s answer:
+ * creates it, updates it, or deletes it, then writes the (possibly
+ * changed) calendar_event_id straight into that task's row and returns it.
+ *
+ * Wrapped in one big try/catch on purpose: Calendar being briefly
+ * unavailable, a quota hiccup, or any other Calendar-side problem must
+ * NEVER stop a task from having already been saved to the sheet a moment
+ * ago (see doAdd/doUpdate/doCapture, which all call this AFTER their own
+ * sheet write). On any failure we just log it and hand back whatever
+ * calendar_event_id the task already had, unchanged.
+ */
+function syncTaskEvent_(sheet, headers, rowNum, task) {
+  const existingId = task.calendar_event_id || "";
+
+  try {
+    const desired = desiredEventState_(task);
+    const cal = getTasksCalendar_();
+    let event = existingId ? cal.getEventById(existingId) : null;
+
+    if (!desired) {
+      if (event) event.deleteEvent();
+      return writeCalendarEventId_(sheet, headers, rowNum, "", existingId);
+    }
+
+    const wantsAllDay = !desired.dueTime;
+
+    // An existing event can't be converted between timed and all-day in
+    // place (CalendarApp only allows setTime on a timed event and
+    // setAllDayDate on an all-day one) — simplest correct fix is to drop
+    // it and create a fresh one that matches what's wanted now.
+    if (event && event.isAllDayEvent() !== wantsAllDay) {
+      event.deleteEvent();
+      event = null;
+    }
+
+    if (!event) {
+      event = wantsAllDay
+        ? cal.createAllDayEvent(desired.title, parseDateOnly_(desired.dueDate), { description: desired.description })
+        : cal.createEvent(
+            desired.title,
+            parseDateTime_(desired.dueDate, desired.dueTime),
+            addMinutes_(parseDateTime_(desired.dueDate, desired.dueTime), 30),
+            { description: desired.description }
+          );
+    } else {
+      event.setTitle(desired.title);
+      event.setDescription(desired.description);
+      if (wantsAllDay) {
+        event.setAllDayDate(parseDateOnly_(desired.dueDate));
+      } else {
+        const start = parseDateTime_(desired.dueDate, desired.dueTime);
+        event.setTime(start, addMinutes_(start, 30));
+      }
+    }
+
+    // Reminders are set fresh every time (remove, then re-add) rather than
+    // trying to detect "did the reminder already match" — simple and
+    // idempotent beats clever here. A timed task gets two nudges (an hour
+    // before, and right at the time); an all-day task gets one, at the
+    // simplest moment that actually notifies.
+    event.removeAllReminders();
+    if (wantsAllDay) {
+      // For an all-day event, "minutes before" counts back from MIDNIGHT,
+      // so 0 would buzz the phone at 00:00. 900 minutes = 09:00 the day
+      // before: a calm "this is due tomorrow" heads-up. The 07:30 digest
+      // event covers the day itself.
+      event.addPopupReminder(900);
+    } else {
+      event.addPopupReminder(60);
+      event.addPopupReminder(0);
+    }
+
+    return writeCalendarEventId_(sheet, headers, rowNum, event.getId(), existingId);
+  } catch (err) {
+    Logger.log("syncTaskEvent_ failed for task " + (task && task.id) + ": " + errorMessage_(err));
+    return existingId;
+  }
+}
+
+/** Writes a new calendar_event_id into one row, but only if it actually
+ * changed — saves a write on the (common) case where syncTaskEvent_
+ * updated an existing event in place. Returns the value written, so
+ * callers can update their own in-memory copy of the task too. */
+function writeCalendarEventId_(sheet, headers, rowNum, newValue, previousValue) {
+  if (newValue === previousValue) return newValue;
+  const col = headers.indexOf("calendar_event_id");
+  if (col !== -1) sheet.getRange(rowNum, col + 1).setValue(newValue);
+  return newValue;
+}
+
+function parseDateOnly_(dateStr) {
+  const parts = String(dateStr).split("-").map(Number);
+  return new Date(parts[0], parts[1] - 1, parts[2]);
+}
+
+function parseDateTime_(dateStr, timeStr) {
+  const dateParts = String(dateStr).split("-").map(Number);
+  const timeParts = String(timeStr).split(":").map(Number);
+  return new Date(dateParts[0], dateParts[1] - 1, dateParts[2], timeParts[0] || 0, timeParts[1] || 0);
+}
+
+function addMinutes_(date, minutes) {
+  return new Date(date.getTime() + minutes * 60000);
+}
+
+/**
+ * Run this by hand (function dropdown → `resync_calendar` → Run) any time
+ * you want the Tasks calendar brought back in line with Tasks2 — e.g. right
+ * after turning Phase 6 on for the first time (to create events for every
+ * dated task that predates this feature), or if you ever deleted an event
+ * by hand in Google Calendar and want it put back. Walks every row once and
+ * runs the exact same create/update/delete decision syncTaskEvent_ uses for
+ * a single task.
+ */
+function resync_calendar() {
+  const ss = getSpreadsheet_();
+  const sheet = ensureTabs_(ss);
+  const headers = getHeaders_(sheet);
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) {
+    Logger.log("resync_calendar: Tasks2 has no data rows — nothing to do.");
+    return;
+  }
+
+  const values = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  let changed = 0;
+  for (let i = 0; i < values.length; i++) {
+    const task = rowToTask_(headers, values[i]);
+    if (!task.id) continue;
+    const before = task.calendar_event_id;
+    const after = syncTaskEvent_(sheet, headers, i + 2, task);
+    if (after !== before) changed++;
+  }
+
+  Logger.log("resync_calendar: checked " + values.length + " row(s), " + changed + " calendar_event_id value(s) changed.");
+}
+
+// ---------------------------------------------------------------------------
+// NIGHTLY TIDY + MORNING DIGEST (Phase 6)
+// ---------------------------------------------------------------------------
+
+/**
+ * PURE: works out what nightlyTidy() should change, without touching the
+ * sheet — this is what runTests() checks directly. Returns a list of
+ * `{ id, fields }` updates, using the same "only these keys change" shape
+ * doUpdate/applyUpdate_ already use, so nightlyTidy() can apply each one
+ * the normal way.
+ *
+ * Three independent rules (checked in this order; a task only ever matches
+ * one):
+ *   1. An ACTIVE task whose do_date has already passed goes back to
+ *      unscheduled (do_date cleared). Not "overdue" — this app has no
+ *      overdue concept on purpose (see docs/01-what-we-built-data-and-ui.md)
+ *      — it just quietly stops claiming you were going to do it on a day
+ *      that's already gone, and last_touched_at is left exactly alone
+ *      (this isn't "you touched it", it's the app tidying up after you).
+ *   2. An ACTIVE task with no due_date that hasn't been touched in
+ *      FADE_DAYS days fades to Someday. Nothing is deleted; it's simply
+ *      out of the way until you're ready for it again.
+ *   3. An INBOX task (a capture nobody has sorted yet) untouched for that
+ *      same FADE_DAYS gets the same gentle fade, so an unsorted capture
+ *      can't silently pile up in Inbox forever either.
+ */
+function planNightlyTidy_(tasks, todayStr, nowIso) {
+  const updates = [];
+
+  for (let i = 0; i < tasks.length; i++) {
+    const t = tasks[i];
+    if (!t || !t.id) continue;
+
+    if (t.status === "active" && t.do_date && t.do_date < todayStr) {
+      updates.push({ id: t.id, fields: { do_date: "" } });
+      continue;
+    }
+
+    if (t.status === "active" && !t.due_date && isOlderThanNDays_(t.last_touched_at, FADE_DAYS, nowIso)) {
+      updates.push({ id: t.id, fields: { status: "someday" } });
+      continue;
+    }
+
+    if (t.status === "inbox" && isOlderThanNDays_(t.last_touched_at, FADE_DAYS, nowIso)) {
+      updates.push({ id: t.id, fields: { status: "someday" } });
+      continue;
+    }
+  }
+
+  return updates;
+}
+
+/** The inverse of isWithinLastNDays_ — true when a timestamp is further
+ * back than `days` days before `nowIso` (or missing/unparseable, which
+ * counts as "old" here, though in practice every task always has a
+ * last_touched_at from the moment it's created). */
+function isOlderThanNDays_(isoTimestamp, days, nowIso) {
+  return !isWithinLastNDays_(isoTimestamp, days, nowIso);
+}
+
+/**
+ * Runs automatically once a day, roughly 3am (see installTriggers()). Reads
+ * every Tasks2 row once, works out what should change with the pure
+ * planNightlyTidy_ above, writes back only the rows that actually changed,
+ * then rebuilds the 07:30 digest event so it reflects tonight's tidying.
+ *
+ * You can also run this by hand from the editor (function dropdown →
+ * `nightlyTidy` → Run) any time you want to see it work without waiting for
+ * 3am — see docs/RUNBOOK.md section K.
+ */
+function nightlyTidy() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const ss = getSpreadsheet_();
+    const sheet = ensureTabs_(ss);
+    const headers = getHeaders_(sheet);
+    const lastRow = sheet.getLastRow();
+
+    if (lastRow < 2) {
+      Logger.log("nightlyTidy: Tasks2 has no data rows — nothing to tidy.");
+    } else {
+      const values = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+      const tasks = rowsToTasks_(headers, values);
+      const today = todayString_();
+      const nowIso = nowIso_();
+      const updates = planNightlyTidy_(tasks, today, nowIso);
+
+      const idToIndex = {};
+      for (let i = 0; i < tasks.length; i++) idToIndex[tasks[i].id] = i;
+
+      let unscheduledCount = 0;
+      let fadedCount = 0;
+      for (let i = 0; i < updates.length; i++) {
+        const update = updates[i];
+        const idx = idToIndex[update.id];
+        if (idx === undefined) continue; // shouldn't happen, but never crash the whole run over one row
+
+        const merged = Object.assign({}, tasks[idx], update.fields);
+        sheet.getRange(idx + 2, 1, 1, headers.length).setValues([taskToRowValues_(headers, merged)]);
+
+        if ("do_date" in update.fields) unscheduledCount++;
+        if ("status" in update.fields) fadedCount++;
+      }
+
+      Logger.log(
+        "nightlyTidy: " + updates.length + " task(s) updated (" +
+        unscheduledCount + " unscheduled, " + fadedCount + " faded to someday)."
+      );
+    }
+  } finally {
+    lock.releaseLock();
+  }
+
+  // Outside the lock: this does its own sheet read (of whatever the tidy
+  // pass just left behind) and its own Calendar calls, and — like every
+  // other Calendar-touching function here — never throws.
+  buildDigestEvent_();
+}
+
+/**
+ * PURE: builds the 07:30 digest event's title and description from
+ * today's tasks. No CalendarApp access, so runTests() can check it
+ * directly. Deliberately never mentions how many tasks are unscheduled or
+ * sitting in the backlog — see docs/01-what-we-built-data-and-ui.md for why
+ * this app never turns "stuff you haven't done" into a number to feel bad
+ * about. It only ever talks about today.
+ */
+function buildDigestText_(tasks, todayStr) {
+  const openLine = "Open: " + APP_URL;
+
+  const todays = (tasks || []).filter(function (t) {
+    return t && t.status === "active" && (t.do_date === todayStr || t.due_date === todayStr);
+  });
+
+  if (todays.length === 0) {
+    return {
+      title: "Today: a clean slate — pick 3 in the app",
+      description: openLine,
+    };
+  }
+
+  const withEstimate = todays.filter(function (t) { return typeof t.est_min === "number" && t.est_min > 0; });
+  const pool = withEstimate.length ? withEstimate : todays;
+  const shortest = pool.slice().sort(function (a, b) { return (a.est_min || 0) - (b.est_min || 0); })[0];
+
+  const title = "Today: " + todays.length + " things — start with " + shortest.title;
+
+  const shown = todays.slice(0, 8);
+  const lines = shown.map(function (t) { return "• " + t.title; });
+  if (todays.length > 8) lines.push("…and more");
+  const description = lines.join("\n") + "\n\n" + openLine;
+
+  return { title: title, description: description };
+}
+
+/**
+ * Deletes the previous digest event (tracked by Script Property
+ * DIGEST_EVENT_ID, so we always know exactly which event to remove even
+ * across script restarts) and creates today's replacement: a 07:30–07:40
+ * event in the Tasks calendar with one popup reminder at the time. Called
+ * at the end of nightlyTidy() every night, and safe to call by hand too
+ * (function dropdown → `buildDigestEvent_` → Run) if you want to see
+ * today's digest appear without waiting for 3am.
+ *
+ * Same try/catch discipline as syncTaskEvent_: nightlyTidy()'s sheet
+ * changes have already happened by the time this runs, and a Calendar
+ * problem here must never look like the whole nightly tidy failed.
+ */
+function buildDigestEvent_() {
+  try {
+    const cal = getTasksCalendar_();
+    const props = PropertiesService.getScriptProperties();
+    const previousId = props.getProperty("DIGEST_EVENT_ID");
+    if (previousId) {
+      const previous = cal.getEventById(previousId);
+      if (previous) previous.deleteEvent();
+    }
+
+    const ss = getSpreadsheet_();
+    const sheet = ensureTabs_(ss);
+    const headers = getHeaders_(sheet);
+    const lastRow = sheet.getLastRow();
+    const tasks = lastRow < 2
+      ? []
+      : rowsToTasks_(headers, sheet.getRange(2, 1, lastRow - 1, headers.length).getValues());
+
+    const today = todayString_();
+    const text = buildDigestText_(tasks, today);
+
+    const start = parseDateTime_(today, "07:30");
+    const end = parseDateTime_(today, "07:40");
+    const event = cal.createEvent(text.title, start, end, { description: text.description });
+    event.removeAllReminders();
+    event.addPopupReminder(0);
+
+    props.setProperty("DIGEST_EVENT_ID", event.getId());
+  } catch (err) {
+    Logger.log("buildDigestEvent_ failed: " + errorMessage_(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TRIGGER INSTALLATION (Phase 6 — run these by hand, once, from the editor)
+// ---------------------------------------------------------------------------
+
+/**
+ * Turns on the nightly tidy. Run once by hand (function dropdown →
+ * `installTriggers` → Run) — see docs/RUNBOOK.md section K. Always removes
+ * any existing nightlyTidy trigger first, so running this twice by
+ * accident can never create a duplicate (which would otherwise mean the
+ * whole tidy — and the digest delete/recreate inside it — running twice
+ * every night).
+ *
+ * Apps Script time-based triggers don't fire at an exact minute:
+ * `atHour(3)` means "some time in the 3:00–3:15am window", not "at exactly
+ * 3:00am". That's normal and nothing to worry about.
+ */
+function installTriggers() {
+  removeTriggers();
+  ScriptApp.newTrigger("nightlyTidy").timeBased().everyDays(1).atHour(3).create();
+  Logger.log("Installed the nightly tidy trigger — it'll fire roughly once a day between 3:00 and 3:15am.");
+}
+
+/** Turns the nightly tidy back off. Run by hand (function dropdown →
+ * `removeTriggers` → Run) if you ever want to pause it. */
+function removeTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  let removed = 0;
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "nightlyTidy") {
+      ScriptApp.deleteTrigger(triggers[i]);
+      removed++;
+    }
+  }
+  Logger.log("Removed " + removed + " existing nightlyTidy trigger(s).");
 }
 
 // ---------------------------------------------------------------------------
@@ -1369,6 +1866,22 @@ function runTests() {
   test_buildFallbackTask_usesFirstLineAsTitle_(results);
   test_buildFallbackTask_truncatesLongFirstLine_(results);
 
+  test_desiredEventState_datedActiveIsWanted_(results);
+  test_desiredEventState_doneIsNotWanted_(results);
+  test_desiredEventState_noDueDateIsNotWanted_(results);
+  test_desiredEventState_inboxWithDueDateIsWanted_(results);
+
+  test_planNightlyTidy_rollsBackStaleDoDate_(results);
+  test_planNightlyTidy_fadesUntouchedNoDueDate_(results);
+  test_planNightlyTidy_keepsTasksWithDueDate_(results);
+  test_planNightlyTidy_keepsRecentlyTouched_(results);
+  test_planNightlyTidy_fadesUntouchedInbox_(results);
+  test_planNightlyTidy_ignoresDoneAndSomeday_(results);
+
+  test_buildDigestText_withTasks_(results);
+  test_buildDigestText_empty_(results);
+  test_buildDigestText_truncatesOverEight_(results);
+
   const failed = results.filter(function (r) { return !r.pass; });
   Logger.log(results.map(function (r) {
     return (r.pass ? "PASS: " : "FAIL: ") + r.name;
@@ -1718,4 +2231,137 @@ function test_buildFallbackTask_truncatesLongFirstLine_(results) {
   const row = buildFallbackTask_(longLine, "id-2", "2026-01-01T00:00:00.000Z");
   assert_(results, "buildFallbackTask_ truncates an overlong first line to 80 chars + an ellipsis",
     row.title.length === 81 && row.title.slice(-1) === "…");
+}
+
+// --- Phase 6: desiredEventState_ -------------------------------------------
+
+function test_desiredEventState_datedActiveIsWanted_(results) {
+  const state = desiredEventState_({
+    id: "1", status: "active", title: "Renew passport", notes: "Check expiry first",
+    due_date: "2026-02-01", due_time: "",
+  });
+  assert_(results, "desiredEventState_ wants an event for an active task with a due_date",
+    state !== null && state.title === "Renew passport" && state.dueDate === "2026-02-01" &&
+    state.description.indexOf("Check expiry first") !== -1 &&
+    state.description.indexOf("Open: " + APP_URL) !== -1);
+}
+
+function test_desiredEventState_doneIsNotWanted_(results) {
+  const state = desiredEventState_({
+    id: "2", status: "done", title: "Old task", notes: "", due_date: "2026-02-01", due_time: "",
+  });
+  assert_(results, "desiredEventState_ never wants an event for a done task, even with a due_date",
+    state === null);
+}
+
+function test_desiredEventState_noDueDateIsNotWanted_(results) {
+  const state = desiredEventState_({
+    id: "3", status: "active", title: "Someday-ish", notes: "", due_date: "", due_time: "",
+  });
+  assert_(results, "desiredEventState_ doesn't want an event when there's no due_date",
+    state === null);
+}
+
+function test_desiredEventState_inboxWithDueDateIsWanted_(results) {
+  const state = desiredEventState_({
+    id: "4", status: "inbox", title: "Sort this later", notes: "", due_date: "2026-02-01", due_time: "09:00",
+  });
+  assert_(results, "desiredEventState_ also wants an event for an inbox task with a due_date",
+    state !== null && state.dueTime === "09:00");
+}
+
+// --- Phase 6: planNightlyTidy_ ----------------------------------------------
+
+function test_planNightlyTidy_rollsBackStaleDoDate_(results) {
+  const tasks = [
+    { id: "1", status: "active", do_date: "2026-01-01", due_date: "", last_touched_at: "2026-01-04T00:00:00.000Z" },
+  ];
+  const updates = planNightlyTidy_(tasks, "2026-01-05", "2026-01-05T03:00:00.000Z");
+  assert_(results, "planNightlyTidy_ clears a do_date that's already in the past on an unfinished active task",
+    updates.length === 1 && updates[0].id === "1" &&
+    updates[0].fields.do_date === "" && !("status" in updates[0].fields));
+}
+
+function test_planNightlyTidy_fadesUntouchedNoDueDate_(results) {
+  const tasks = [
+    { id: "2", status: "active", do_date: "", due_date: "", last_touched_at: "2025-12-01T00:00:00.000Z" },
+  ];
+  const updates = planNightlyTidy_(tasks, "2026-01-05", "2026-01-05T03:00:00.000Z");
+  assert_(results, "planNightlyTidy_ fades an active, due-date-less task untouched over 21 days to someday",
+    updates.length === 1 && updates[0].fields.status === "someday");
+}
+
+function test_planNightlyTidy_keepsTasksWithDueDate_(results) {
+  const tasks = [
+    { id: "3", status: "active", do_date: "", due_date: "2026-03-01", last_touched_at: "2025-12-01T00:00:00.000Z" },
+  ];
+  const updates = planNightlyTidy_(tasks, "2026-01-05", "2026-01-05T03:00:00.000Z");
+  assert_(results, "planNightlyTidy_ never fades a task that has a due_date, no matter how stale",
+    updates.length === 0);
+}
+
+function test_planNightlyTidy_keepsRecentlyTouched_(results) {
+  const tasks = [
+    { id: "4", status: "active", do_date: "", due_date: "", last_touched_at: "2026-01-04T12:00:00.000Z" },
+  ];
+  const updates = planNightlyTidy_(tasks, "2026-01-05", "2026-01-05T03:00:00.000Z");
+  assert_(results, "planNightlyTidy_ leaves a recently-touched task alone",
+    updates.length === 0);
+}
+
+function test_planNightlyTidy_fadesUntouchedInbox_(results) {
+  const tasks = [
+    { id: "5", status: "inbox", do_date: "", due_date: "", last_touched_at: "2025-11-01T00:00:00.000Z" },
+  ];
+  const updates = planNightlyTidy_(tasks, "2026-01-05", "2026-01-05T03:00:00.000Z");
+  assert_(results, "planNightlyTidy_ fades a long-untouched inbox capture to someday too",
+    updates.length === 1 && updates[0].fields.status === "someday");
+}
+
+function test_planNightlyTidy_ignoresDoneAndSomeday_(results) {
+  const tasks = [
+    { id: "6", status: "done", do_date: "2026-01-01", due_date: "", last_touched_at: "2025-01-01T00:00:00.000Z" },
+    { id: "7", status: "someday", do_date: "", due_date: "", last_touched_at: "2025-01-01T00:00:00.000Z" },
+  ];
+  const updates = planNightlyTidy_(tasks, "2026-01-05", "2026-01-05T03:00:00.000Z");
+  assert_(results, "planNightlyTidy_ never touches done or someday tasks",
+    updates.length === 0);
+}
+
+// --- Phase 6: buildDigestText_ ----------------------------------------------
+
+function test_buildDigestText_withTasks_(results) {
+  const tasks = [
+    { id: "1", status: "active", title: "Water plants", do_date: "2026-01-05", due_date: "", est_min: 5 },
+    { id: "2", status: "active", title: "Pay electric bill", do_date: "", due_date: "2026-01-05", est_min: 20 },
+  ];
+  const text = buildDigestText_(tasks, "2026-01-05");
+  assert_(results, "buildDigestText_ names the count and the shortest task in the title",
+    text.title.indexOf("2 things") !== -1 && text.title.indexOf("Water plants") !== -1);
+  assert_(results, "buildDigestText_ lists every today task as a bullet, then the Open link",
+    text.description.indexOf("• Water plants") !== -1 &&
+    text.description.indexOf("• Pay electric bill") !== -1 &&
+    text.description.indexOf("Open: " + APP_URL) !== -1);
+}
+
+function test_buildDigestText_empty_(results) {
+  const text = buildDigestText_([], "2026-01-05");
+  assert_(results, "buildDigestText_ gives a clean-slate title when nothing is due or scheduled today",
+    text.title === "Today: a clean slate — pick 3 in the app");
+  assert_(results, "buildDigestText_ never mentions unscheduled/backlog counts, even with tasks that exist but aren't today's",
+    text.description.toLowerCase().indexOf("unscheduled") === -1 &&
+    text.description.toLowerCase().indexOf("backlog") === -1);
+}
+
+function test_buildDigestText_truncatesOverEight_(results) {
+  const tasks = [];
+  for (let i = 0; i < 10; i++) {
+    tasks.push({ id: String(i), status: "active", title: "Task " + i, do_date: "2026-01-05", due_date: "", est_min: 10 });
+  }
+  const text = buildDigestText_(tasks, "2026-01-05");
+  const bulletLines = text.description.split("\n").filter(function (l) { return l.indexOf("•") === 0; });
+  assert_(results, "buildDigestText_ shows at most 8 bullets even when more tasks are due today",
+    bulletLines.length === 8);
+  assert_(results, "buildDigestText_ adds an '…and more' line when truncating",
+    text.description.indexOf("…and more") !== -1);
 }

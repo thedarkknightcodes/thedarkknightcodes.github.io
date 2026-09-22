@@ -168,7 +168,15 @@ function applyFieldUpdate(task, fields, toastMessage) {
  * the AI result eventually comes back, we can honour the "Today" chip for
  * whichever of ITS tasks the AI left undated (see applyCaptureResult).
  */
-function handleCapture(raw, todayOn) {
+/**
+ * `sourceHint` is "typed" (the normal capture box, the default) or "share"
+ * (Phase 5: arrived via Android's share sheet — see readShareTarget()
+ * below). It rides along on the capture payload purely so the backend's
+ * Log tab can tell the two apart later ("capture:share" vs
+ * "capture:typed") — it changes nothing else about how the capture is
+ * handled.
+ */
+function handleCapture(raw, todayOn, sourceHint) {
   const trimmed = String(raw || "").trim();
   if (!trimmed) return;
 
@@ -178,7 +186,7 @@ function handleCapture(raw, todayOn) {
   store.enqueueOp({
     op_id: opId,
     action: "capture",
-    payload: { raw: trimmed, op_id: opId, today_hint: today },
+    payload: { raw: trimmed, op_id: opId, today_hint: today, source_hint: sourceHint || "typed" },
     todayOn: !!todayOn,
   });
   flushQueue();
@@ -463,6 +471,50 @@ function stripPwaSourceParam() {
   window.history.replaceState({}, "", url.pathname + (url.search || "") + url.hash);
 }
 
+/**
+ * Phase 5: manifest.webmanifest declares a `share_target`, so "Share to
+ * Task Planner" from any Android app opens this page with `title`, `text`
+ * and/or `url` tacked onto the address as a query string. Different apps
+ * fill these in differently — Chrome shares a page as `title` + `url`, but
+ * a lot of apps (voice memo apps, Keep, Rambler, etc.) dump everything
+ * into `text` and leave `url` empty — so rather than trust any one field,
+ * we read all three and use whichever ones actually have something in
+ * them, in that order.
+ *
+ * Returns the text to capture ("" if this wasn't a share at all), and —
+ * critically — strips title/text/url from the visible URL BEFORE returning
+ * anything, using history.replaceState. That happens first, unconditionally,
+ * so that reloading the page (or the browser restoring this tab later)
+ * can never re-run the same capture a second time.
+ */
+function readShareTarget() {
+  const url = new URL(window.location.href);
+  const params = url.searchParams;
+  if (!params.has("title") && !params.has("text") && !params.has("url")) return "";
+
+  const rawParts = [params.get("title"), params.get("text"), params.get("url")]
+    .map(function (p) { return (p || "").trim(); })
+    .filter(function (p) { return p.length > 0; });
+
+  // De-duplicate while keeping the first-seen order — Chrome, for example,
+  // often shares a page as the SAME string in both `text` and `url`, and a
+  // capture with the same line twice is just noise.
+  const seen = new Set();
+  const parts = [];
+  for (const p of rawParts) {
+    if (seen.has(p)) continue;
+    seen.add(p);
+    parts.push(p);
+  }
+
+  params.delete("title");
+  params.delete("text");
+  params.delete("url");
+  window.history.replaceState({}, "", url.pathname + (params.toString() ? "?" + params.toString() : "") + url.hash);
+
+  return parts.join("\n");
+}
+
 /** Registers the service worker that makes the app shell available
  * offline (see sw.js). Harmless to call in `?mock=1` mode too — it just
  * caches the same static files either way. */
@@ -494,6 +546,10 @@ function registerServiceWorker() {
 
 async function init() {
   stripPwaSourceParam();
+  // Read (and immediately strip) any share-target params before anything
+  // else touches the URL — see readShareTarget()'s comment for why the
+  // stripping has to happen up front rather than after we act on it.
+  const sharedRaw = readShareTarget();
   wireInstallPrompt();
   registerServiceWorker();
 
@@ -516,6 +572,12 @@ async function init() {
   // Record "opened today" for next visit's Pick 3 logic, using local today
   // — we don't need to wait for the server's clock just for this.
   store.setLastOpen(logic.todayStr());
+
+  // A shared capture behaves exactly like typing it into the box with
+  // "Today" checked: instant "Got it ✓" toast, a "Sorting…" row while it's
+  // in flight, queued (and retried) the same as everything else if
+  // there's no signal right now.
+  if (sharedRaw) handleCapture(sharedRaw, true, "share");
 
   if (hasKey) {
     await refreshTasks();
