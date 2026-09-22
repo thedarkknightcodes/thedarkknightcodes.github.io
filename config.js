@@ -12,6 +12,6 @@
 // public AND it had no device key, so the URL alone was enough to read and
 // change every task.)
 window.PLANNER_CONFIG = {
-  prodUrl: "PASTE_PROD_EXEC_URL_HERE",
+  prodUrl: "https://script.google.com/macros/s/AKfycbw8fHeY0u5Yg-CUAj3DW6Hx-G2_e_XmiyUQyViKsgdasmCKjy1u2dxIXVVgd17mSU_Zsg/exec",
   stagingUrl: "",
 };
